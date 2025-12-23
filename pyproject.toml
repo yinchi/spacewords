@@ -1,0 +1,21 @@
+[project]
+name = "spacewords"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Yin-Chi Chan", email = "ycc39@cam.ac.uk" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "numpy>=2.3.5",
+    "pydantic-settings>=2.12.0",
+    "sortedcontainers>=2.4.0",
+]
+
+[project.scripts]
+spw = "spacewords:main"
+
+[build-system]
+requires = ["uv_build>=0.9.3,<0.10.0"]
+build-backend = "uv_build"

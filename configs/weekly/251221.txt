@@ -1,0 +1,11 @@
+8 9
+AAAAABBBCCDDEEEEEEEFFFFGGGHHIIJKLLMMMNNNOOOOPPPRRSSSTTTUUUUVWYY
+
+ F L A P J A C K S
+ . . . . # . . # .
+ . . # . . . . . .
+ . . . . . # . . .
+ . # . . . . . . .
+ # . . . # . . . .
+ . . . . . . # . .
+ . . . # . . . . .
