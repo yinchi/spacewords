@@ -4,6 +4,7 @@ from collections import defaultdict
 from typing import NamedTuple
 
 from bitarray import bitarray
+from bitarray.util import zeros
 
 from spacewords2.slot import Direction, Intersection, Slot, SlotPosition
 from spacewords2.tiles import TileBag, create_tile_bag
@@ -177,13 +178,13 @@ class Board:
 
         try:
             # Update board layout, validating against existing letters and tracking tiles used
+            direction, start_row, start_col = slot.pos
+            base = start_row * self.n_cols + start_col
             for i in range(slot.length):
-                direction, start_row, start_col = slot.pos
                 if direction == Direction.ACROSS:
-                    row, col = start_row, start_col + i
+                    idx = base + i
                 else:
-                    row, col = start_row + i, start_col
-                idx = row * self.n_cols + col
+                    idx = base + i * self.n_cols
                 board_ch = self.layout[idx]
                 word_ch = ord(word[i])
                 if board_ch == ord("."):
@@ -209,8 +210,7 @@ class Board:
 
             # Place the word by setting its slot's domain to a single word (by swapping
             # the domain reference, not mutating the existing bitarray).
-            new_domain = bitarray(len(WORDS_BY_LENGTH[slot.length]))
-            new_domain.setall(False)
+            new_domain = zeros(len(WORDS_BY_LENGTH[slot.length]))
             new_domain[WORD_INDEXES[word]] = True
             slot.domain = new_domain
             slot.domain_size = 1
