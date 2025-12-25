@@ -113,12 +113,11 @@ class Intersection(NamedTuple):
 
 
 class _UndoInfo(NamedTuple):
-    """Information needed to undo a word placement."""
+    """Marker into the undo trails for a single move."""
 
-    old_layout: bytearray
-    old_tile_bag: TileBag
-    old_domains: dict[SlotPosition, bitarray]
-    old_domain_sizes: dict[SlotPosition, int]
+    layout_mark: int
+    tile_mark: int
+    domain_mark: int
 
 
 class Board:
@@ -143,6 +142,11 @@ class Board:
 
         self.slot_map: dict[SlotPosition, Slot] = {}
         """Mapping from positions to Slot objects."""
+
+        # Undo trails (used by place_word / undo_place_word)
+        self._layout_changes: list[tuple[int, int]] = []
+        self._tile_decrements: list[int] = []
+        self._domain_changes: list[tuple[SlotPosition, bitarray, int]] = []
 
         self.intersection_map: defaultdict[tuple[int, int], list[Intersection]] = defaultdict(list)
         """Mapping from cell positions (row, col) to a list of
@@ -231,6 +235,8 @@ class Board:
         Raises:
             ValueError: If the word cannot be placed due to conflicts or invalidity.
         """
+        word = word.upper()
+
         # Retrieve the slot
         slot = self.slot_map.get(pos)
         if slot is None:
@@ -247,11 +253,12 @@ class Board:
             raise ValueError(f"Word '{word}' is not in the word list.")
 
         undo_info = _UndoInfo(
-            old_layout=self.layout[:],
-            old_tile_bag=tile_bag[:],
-            old_domains={},
-            old_domain_sizes={},
+            layout_mark=len(self._layout_changes),
+            tile_mark=len(self._tile_decrements),
+            domain_mark=len(self._domain_changes),
         )
+
+        changed_domains: set[SlotPosition] = set()
 
         try:
             # Update board layout, validating against existing letters and tracking tiles used
@@ -261,14 +268,18 @@ class Board:
                     row, col = start_row, start_col + i
                 else:
                     row, col = start_row + i, start_col
-                board_ch = self.layout[row * self.n_cols + col]
+                idx = row * self.n_cols + col
+                board_ch = self.layout[idx]
                 word_ch = ord(word[i])
                 if board_ch == ord("."):
                     if tile_bag[word_ch - ord("A")] > 0:
-                        tile_bag[word_ch - ord("A")] -= 1
+                        tile_idx = word_ch - ord("A")
+                        tile_bag[tile_idx] -= 1
+                        self._tile_decrements.append(tile_idx)
                     else:
                         raise ValueError(f"Not enough tiles to place word '{word}' at {pos}.")
-                    self.layout[row * self.n_cols + col] = word_ch
+                    self._layout_changes.append((idx, board_ch))
+                    self.layout[idx] = word_ch
                 elif board_ch != word_ch:
                     raise ValueError(
                         f"Conflict placing word '{word}' at {pos}: "
@@ -276,13 +287,17 @@ class Board:
                         f"position {i}."
                     )
 
-            # The first slot we change is the one we are placing the word in
-            undo_info.old_domains[pos] = slot.domain.copy()
-            undo_info.old_domain_sizes[pos] = slot.domain_size
+            # The first slot we change is the one we are placing the word in.
+            if pos not in changed_domains:
+                self._domain_changes.append((pos, slot.domain, slot.domain_size))
+                changed_domains.add(pos)
 
-            # Place the word by setting its slot's domain to a single word
-            slot.domain.setall(0)
-            slot.domain[WORD_INDEXES[word]] = 1
+            # Place the word by setting its slot's domain to a single word (by swapping
+            # the domain reference, not mutating the existing bitarray).
+            new_domain = bitarray(len(WORDS_BY_LENGTH[slot.length]))
+            new_domain.setall(False)
+            new_domain[WORD_INDEXES[word]] = True
+            slot.domain = new_domain
             slot.domain_size = 1
 
             # Update domains of intersecting slots
@@ -299,20 +314,22 @@ class Board:
                     raise RuntimeError("Uninitialized slot_start in other_slot.")
 
                 other_slot_start = other_slot.pos
-                if other_slot_start not in undo_info.old_domains:
+                if other_slot_start not in changed_domains:
                     # Only save old domain once (it may be updated multiple times)
-                    undo_info.old_domains[other_slot_start] = other_slot.domain.copy()
-                    undo_info.old_domain_sizes[other_slot_start] = other_slot.domain_size
+                    self._domain_changes.append(
+                        (other_slot_start, other_slot.domain, other_slot.domain_size)
+                    )
+                    changed_domains.add(other_slot_start)
 
-                other_slot.domain &= char_bits
-                other_slot.domain_size = other_slot.domain.count()
-
-                # If any slot's domain becomes empty, raise an error
-                if not other_slot.domain.any():
+                # Swap domain reference instead of mutating in place.
+                new_other_domain = other_slot.domain & char_bits
+                if not new_other_domain.any():
                     raise ValueError(
                         f"Placing word '{word}' causes slot at {other_slot_start} to have "
                         "no valid words."
                     )
+                other_slot.domain = new_other_domain
+                other_slot.domain_size = new_other_domain.count()
 
             return undo_info
 
@@ -328,27 +345,24 @@ class Board:
             undo_info: The information needed to undo the word placement.
             tile_bag: The current tile bag representing available tiles.  Restored in-place.
         """
+        # Restore slot domains (and sizes)
+        while len(self._domain_changes) > undo_info.domain_mark:
+            pos, old_domain, old_size = self._domain_changes.pop()
+            slot = self.slot_map.get(pos)
+            if slot is None:
+                raise RuntimeError(f"No slot found at position {pos} during undo.")
+            slot.domain = old_domain
+            slot.domain_size = old_size
+
         # Restore board layout
-        self.layout = undo_info.old_layout
+        while len(self._layout_changes) > undo_info.layout_mark:
+            idx, old_byte = self._layout_changes.pop()
+            self.layout[idx] = old_byte
 
         # Restore tile bag
-        tile_bag[:] = undo_info.old_tile_bag
-
-        # Restore slot domains
-        for pos, old_domain in undo_info.old_domains.items():
-            slot = self.slot_map.get(pos)
-            if slot is not None:
-                slot.domain = old_domain
-            else:
-                raise RuntimeError(f"No slot found at position {pos} during undo.")
-
-        # Restore domain sizes
-        for pos, old_domain_size in undo_info.old_domain_sizes.items():
-            slot = self.slot_map.get(pos)
-            if slot is not None:
-                slot.domain_size = old_domain_size
-            else:
-                raise RuntimeError(f"No slot found at position {pos} during undo.")
+        while len(self._tile_decrements) > undo_info.tile_mark:
+            tile_idx = self._tile_decrements.pop()
+            tile_bag[tile_idx] += 1
 
     def solve(self, tile_bag: TileBag, first_pos: SlotPosition) -> "Board":
         """Solve the board using the available tiles in the tile bag (TODO).
