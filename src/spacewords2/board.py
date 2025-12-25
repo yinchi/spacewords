@@ -14,6 +14,8 @@ from spacewords2.tiles import TileBag, create_tile_bag
 from spacewords2.util import int_comma, time_str
 from spacewords2.words import WORD_BUCKETS, WORD_INDEXES, WORDS_BY_LENGTH
 
+REPORT_INTERVAL = 100_000
+
 
 class _UndoInfo(NamedTuple):
     """Marker into the undo trails for a single move.
@@ -507,12 +509,13 @@ class Board:
         self.solve_stats.max_depth_reached = max(self.solve_stats.max_depth_reached, depth)
 
         # Display progress every 10,000 boards checked
-        if self.solve_stats.boards_checked % 10000 == 0:
+        if self.solve_stats.boards_checked % REPORT_INTERVAL == 0:
             elapsed_time = time() - self.solve_stats.start_time
             print(
                 f"Checked {int_comma(self.solve_stats.boards_checked)} board states "
                 f"after {time_str(elapsed_time)}; max depth {self.solve_stats.max_depth_reached}, "
-                f"current depth {depth}."
+                f"current depth {depth}.",
+                flush=True,
             )
 
         def _slot_sort_key(pos: SlotPosition) -> tuple[int, int, int, int, int]:
