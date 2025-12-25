@@ -38,6 +38,30 @@ class _UndoTrails(NamedTuple):
     """
 
 
+NeighborMap = dict[SlotPosition, list[tuple[SlotPosition, int, int]]]
+"""Mapping from slot positions to lists of tuples representing intersections.
+
+Each tuple is of the form (other_slot_position, index_in_this_slot, index_in_other_slot).
+"""
+
+ArcMap = dict[tuple[SlotPosition, SlotPosition], tuple[int, int]]
+"""Mapping from pairs of slot positions to their intersection indices.
+
+Each key is a tuple (slot_position_1, slot_position_2), and the value is a tuple
+(index_in_slot_1, index_in_slot_2).
+"""
+
+
+class ConstraintGraph(NamedTuple):
+    """Constraint graph representing slot intersections."""
+
+    neighbors: NeighborMap
+    """Neighbor mapping from slot positions to their intersecting slots."""
+
+    arc_map: ArcMap
+    """Mapping from pairs of slot positions to their intersection indices."""
+
+
 class Board:
     """Represents the game board."""
 
@@ -127,6 +151,12 @@ class Board:
                     if intersection.other_slot.pos.direction == other_direction:
                         slot.intersections[i] = intersection
 
+        self.constraint_graph = self._build_constraint_graph()
+        """Precomputed constraint graph for the board.
+
+        Since board topology does not change, this is built once at initialization.
+        """
+
     def print(self):
         """Prints the board layout."""
         for row in range(self.n_rows):
@@ -136,6 +166,49 @@ class Board:
                 .replace("#", "█")
             )
             print(line)
+
+    def _build_constraint_graph(
+        self,
+    ) -> ConstraintGraph:
+        """Build the slot-intersection constraint graph.
+
+        Returns:
+            (neighbors, arc_map)
+
+            - neighbors[x] is a list of (y, i, j) meaning slot x at index i intersects
+              slot y at index j.
+            - arc_map[(x, y)] == (i, j) for fast lookup during arc-consistency (AC-3).
+
+        Notes:
+            In this puzzle, a pair of perpendicular slots can intersect at most once, so
+            (x, y) identifies a unique (i, j).
+        """
+        neighbors: dict[SlotPosition, list[tuple[SlotPosition, int, int]]] = {
+            pos: [] for pos in self.slot_map
+        }
+        arc_map: dict[tuple[SlotPosition, SlotPosition], tuple[int, int]] = {}
+
+        for pos, slot in self.slot_map.items():
+            for i, intersection in enumerate(slot.intersections):
+                if intersection is None:
+                    continue
+                other_slot = intersection.other_slot
+                if other_slot.pos is None:
+                    raise RuntimeError("Uninitialized position in other_slot.")
+                other_pos = other_slot.pos
+                j = intersection.index_in_other_slot
+
+                neighbors[pos].append((other_pos, i, j))
+
+                key = (pos, other_pos)
+                prev = arc_map.get(key)
+                if prev is not None and prev != (i, j):
+                    raise RuntimeError(
+                        f"Multiple intersections found between {pos} and {other_pos}."
+                    )
+                arc_map[key] = (i, j)
+
+        return ConstraintGraph(neighbors, arc_map)
 
     def place_word(self, pos: SlotPosition, word: str, tile_bag: TileBag) -> _UndoInfo:
         """Place a word in the specified slot.  Modifies both the board and `tile_bag` in-place.
@@ -380,6 +453,23 @@ def test_board():
         Intersection(board.slot_map[SlotPosition(Direction.ACROSS, 0, 1)], 0),
         Intersection(board.slot_map[SlotPosition(Direction.ACROSS, 1, 0)], 1),
         Intersection(board.slot_map[SlotPosition(Direction.ACROSS, 2, 1)], 0),
+    ]
+
+    # ACROSS LOOK intersects DOWN BOO at LOOK[1] == BOO[1]
+    assert board.constraint_graph.arc_map[
+        (SlotPosition(Direction.ACROSS, 1, 0), SlotPosition(Direction.DOWN, 0, 1))
+    ] == (1, 1)
+    # DOWN .O. intersects ACROSS LOOK at .O.[1] == LOOK[2]
+    assert board.constraint_graph.arc_map[
+        (SlotPosition(Direction.DOWN, 0, 2), SlotPosition(Direction.ACROSS, 1, 0))
+    ] == (1, 2)
+
+    # Check neighbor lists for LOOK and BOO, which intersect at index 1 of both slots
+    assert (SlotPosition(Direction.DOWN, 0, 1), 1, 1) in board.constraint_graph.neighbors[
+        SlotPosition(Direction.ACROSS, 1, 0)
+    ]
+    assert (SlotPosition(Direction.ACROSS, 1, 0), 1, 1) in board.constraint_graph.neighbors[
+        SlotPosition(Direction.DOWN, 0, 1)
     ]
 
     # Create a tile bag with one of each letter A-Z
