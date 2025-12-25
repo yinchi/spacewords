@@ -14,7 +14,17 @@ from spacewords2.tiles import TileBag, create_tile_bag
 from spacewords2.util import int_comma, time_str
 from spacewords2.words import WORD_BUCKETS, WORD_INDEXES, WORDS_BY_LENGTH
 
-REPORT_INTERVAL = 100_000
+REPORT_INTERVAL = 10_000
+"""Interval (in number of boards checked) for reporting progress during solving."""
+
+REPORT_HI_SCORE_MIN = 10
+"""Report new best board only if at least this many slots are filled."""
+
+TILE_AWARE_MRV_CANDIDATES = 8
+"""Number of top MRV candidates to consider for tile-aware selection."""
+
+TILE_AWARE_MRV_MAX_CANDIDATES = 32
+"""Maximum number of candidates to consider for tile-aware MRV (caps overhead)."""
 
 
 class _UndoInfo(NamedTuple):
@@ -26,6 +36,7 @@ class _UndoInfo(NamedTuple):
     layout_mark: int
     tile_mark: int
     domain_mark: int
+    filled_mark: int
 
 
 class _UndoTrails(NamedTuple):
@@ -41,6 +52,12 @@ class _UndoTrails(NamedTuple):
     """List of (slot_position, old_domain, old_domain_size) tuples.
 
     Each tuple represents changes to slot domains.
+    """
+
+    filled_changes: list[tuple[SlotPosition, bool]]
+    """List of (slot_position, was_unfilled) tuples.
+
+    Used to restore `Board._unfilled_slots` during undo.
     """
 
 
@@ -81,6 +98,15 @@ class SolverStats:
     max_depth_reached: int = 0
     """Maximum recursion depth reached during solving."""
 
+    max_filled_slots: int = 0
+    """Maximum number of filled slots reached during solving."""
+
+
+class ValueError(Exception):
+    """Exception raised when the board is determined to be unsolvable."""
+
+    pass
+
 
 class Board:
     """Represents the game board."""
@@ -106,7 +132,13 @@ class Board:
         """Mapping from positions to Slot objects."""
 
         # Undo trails (used by place_word / undo_place_word)
-        self._undo_trails: _UndoTrails = _UndoTrails([], [], [])
+        self._undo_trails: _UndoTrails = _UndoTrails([], [], [], [])
+
+        # Cached board indices for each slot (hot-path optimization).
+        self._slot_cell_idxs: dict[SlotPosition, tuple[int, ...]] = {}
+
+        # Tracks which slots are not yet fully filled on the board (contain at least one '.')
+        self._unfilled_slots: set[SlotPosition] = set()
 
         self.intersection_map: defaultdict[tuple[int, int], list[Intersection]] = defaultdict(list)
         """Mapping from cell positions (row, col) to a list of
@@ -179,6 +211,24 @@ class Board:
 
         Since board topology does not change, this is built once at initialization.
         """
+
+        # Cache the board indices for each slot (used by place_word / tile checks / etc.).
+        for pos, slot in self.slot_map.items():
+            if slot.pos is None:
+                raise RuntimeError("Uninitialized position in slot.")
+            direction, start_row, start_col = slot.pos
+            base = start_row * self.n_cols + start_col
+            if direction == Direction.ACROSS:
+                self._slot_cell_idxs[pos] = tuple(range(base, base + slot.length))
+            else:
+                self._slot_cell_idxs[pos] = tuple(
+                    range(base, base + self.n_cols * slot.length, self.n_cols)
+                )
+
+        # Initialize unfilled slots from the starting layout.
+        for pos in self.slot_map:
+            if any(self.layout[idx] == ord(".") for idx in self._slot_cell_idxs[pos]):
+                self._unfilled_slots.add(pos)
 
     def print(self):
         """Prints the board layout."""
@@ -268,6 +318,7 @@ class Board:
             layout_mark=len(self._undo_trails.layout_changes),
             tile_mark=len(self._undo_trails.tile_decrements),
             domain_mark=len(self._undo_trails.domain_changes),
+            filled_mark=len(self._undo_trails.filled_changes),
         )
 
         changed_domains: set[SlotPosition] = set()
@@ -275,17 +326,11 @@ class Board:
         try:
             # Cheap pre-check: validate conflicts and ensure the tile bag can cover all new
             # letters needed for this placement, without mutating anything.
-            direction, start_row, start_col = slot.pos
-            base = start_row * self.n_cols + start_col
             pending_writes: list[tuple[int, int]] = []
             needed_tiles = [0] * 26
 
-            for i in range(slot.length):
-                if direction == Direction.ACROSS:
-                    idx = base + i
-                else:
-                    idx = base + i * self.n_cols
-
+            cell_idxs = self._slot_cell_idxs[pos]
+            for i, idx in enumerate(cell_idxs):
                 board_ch = self.layout[idx]
                 word_ch = ord(word[i])
 
@@ -311,6 +356,35 @@ class Board:
                 self._undo_trails.tile_decrements.append(tile_idx)
                 self._undo_trails.layout_changes.append((idx, self.layout[idx]))
                 self.layout[idx] = word_ch
+
+            # Update unfilled-slot tracking. Only slots that include newly filled '.' cells
+            # can transition from unfilled -> filled.
+            affected_slots: set[SlotPosition] = {pos}
+            # Build a quick lookup of written indices for this placement.
+            written_idxs = {idx for idx, _ in pending_writes}
+            for i, idx in enumerate(self._slot_cell_idxs[pos]):
+                if idx not in written_idxs:
+                    continue
+                intersection = slot.intersections[i]
+                if intersection is None:
+                    continue
+                other_pos = intersection.other_slot.pos
+                if other_pos is None:
+                    raise RuntimeError("Uninitialized slot_start in other_slot.")
+                affected_slots.add(other_pos)
+
+            for affected_pos in affected_slots:
+                if affected_pos not in self._unfilled_slots:
+                    continue
+                affected_slot = self.slot_map[affected_pos]
+                if affected_slot.pos is None:
+                    raise RuntimeError("Uninitialized position in slot.")
+                if all(
+                    self.layout[affected_idx] != ord(".")
+                    for affected_idx in self._slot_cell_idxs[affected_pos]
+                ):
+                    self._undo_trails.filled_changes.append((affected_pos, True))
+                    self._unfilled_slots.remove(affected_pos)
 
             # The first slot we change is the one we are placing the word in.
             if pos not in changed_domains:
@@ -388,6 +462,14 @@ class Board:
             tile_idx = self._undo_trails.tile_decrements.pop()
             tile_bag[tile_idx] += 1
 
+        # Restore unfilled-slot tracking
+        while len(self._undo_trails.filled_changes) > undo_info.filled_mark:
+            pos, was_unfilled = self._undo_trails.filled_changes.pop()
+            if was_unfilled:
+                self._unfilled_slots.add(pos)
+            else:
+                self._unfilled_slots.discard(pos)
+
     def solve(self, tile_bag: TileBag, first_pos: SlotPosition) -> "Board":
         """Solve the board using the available tiles in the tile bag (TODO).
 
@@ -449,17 +531,10 @@ class Board:
                 if slot.pos is None:
                     raise RuntimeError("Uninitialized position in slot.")
 
-                direction, start_row, start_col = slot.pos
-                base = start_row * self.n_cols + start_col
-
                 # Effective availability per letter for this slot: tile bag plus letters
                 # already present on the board in this slot.
                 effective = [int(x) for x in tile_bag]
-                for i in range(slot.length):
-                    if direction == Direction.ACROSS:
-                        idx = base + i
-                    else:
-                        idx = base + i * self.n_cols
+                for idx in self._slot_cell_idxs[pos]:
                     ch_byte = self.layout[idx]
                     if ord("A") <= ch_byte <= ord("Z"):
                         effective[ch_byte - ord("A")] += 1
@@ -492,8 +567,19 @@ class Board:
         # One-off pruning before entering recursive solve.
         _prune_domains_by_tiles()
 
-        self.solve_helper(tile_bag, manhattan_distances, slot_degrees, depth=0)
-        return self
+        # Initial filled slots (tracked incrementally from board layout).
+        initial_filled = len(self.slot_map) - len(self._unfilled_slots)
+        print(f"Initial filled slots: {initial_filled} / {len(self.slot_map)}")
+
+        if not self._unfilled_slots:
+            return self
+
+        try:
+            self.solve_helper(tile_bag, manhattan_distances, slot_degrees, depth=0)
+            return self
+        except ValueError as e:
+            # ValueError has propagated up to the top level: no solution found
+            raise ValueError("No solution found for the board with the given tile bag.") from e
 
     def solve_helper(
         self,
@@ -514,7 +600,7 @@ class Board:
             print(
                 f"Checked {int_comma(self.solve_stats.boards_checked)} board states "
                 f"after {time_str(elapsed_time)}; max depth {self.solve_stats.max_depth_reached}, "
-                f"current depth {depth}.",
+                f"current depth {depth}; max filled slots {self.solve_stats.max_filled_slots}.",
                 flush=True,
             )
 
@@ -523,8 +609,8 @@ class Board:
 
             When backtracking, slots to attempt to fill are chosen in order of:
 
-            1. Fewest remaining possible words in the slot's domain (MRV heuristic).
-            2. Largest number of intersections with other slots (degree heuristic).
+            1. Largest number of intersections with other slots (degree heuristic).
+            2. Fewest remaining possible words in the slot's domain (MRV heuristic).
             3. Manhattan distance from `first_pos` (tie-break): encourages local propagation but
                 should not override MRV on larger boards.
             4. Across slots before down slots.
@@ -540,8 +626,8 @@ class Board:
             if slot is None:
                 raise RuntimeError(f"No slot found at position {pos} during sorting.")
             return (
-                slot.domain_size,
                 -slot_degrees[pos],
+                slot.domain_size,
                 manhattan_distances[pos],
                 pos.direction.value,  # 0 for ACROSS, 1 for DOWN (to prefer ACROSS)
                 pos.start_row * self.n_cols + pos.start_col,
@@ -571,31 +657,70 @@ class Board:
             scored.sort(key=lambda t: (-t[0], t[1]))
             return [word_idx for _, word_idx in scored]
 
-        def _slot_filled_on_board(pos: SlotPosition) -> bool:
-            """Check if the slot at `pos` is already filled on the board (no '.' cells).
+        def _tile_playable_domain_size(pos: SlotPosition, cutoff: int | None = None) -> int:
+            """Count how many domain words are playable under the current tile bag.
 
-            If the slot is filled, its domain should already be fixed to a single word, but
-            this is not checked here (only checks the board layout).
+            This is used as a heuristic only (does not mutate domains).
+            The count may be cut off early if it exceeds `cutoff`, which is useful for
+            finding the minimum over multiple slots.
 
             Args:
-                pos: Position of the slot to check.
-
-            Returns:
-                True if the slot is completely filled on the board, False otherwise.
+                pos: Slot position to evaluate.
+                cutoff: Optional early-exit threshold. If the count exceeds cutoff, return early.
             """
             slot = self.slot_map[pos]
             if slot.pos is None:
                 raise RuntimeError("Uninitialized position in slot.")
-            direction, start_row, start_col = slot.pos
-            base = start_row * self.n_cols + start_col
-            for i in range(slot.length):
-                if direction == Direction.ACROSS:
-                    idx = base + i
-                else:
-                    idx = base + i * self.n_cols
-                if self.layout[idx] == ord("."):
-                    return False
-            return True
+
+            cell_idxs = self._slot_cell_idxs[pos]
+            open_positions = [i for i, idx in enumerate(cell_idxs) if self.layout[idx] == ord(".")]
+
+            # If this slot has no open cells, it should not be considered unfilled.
+            if not open_positions:
+                return slot.domain_size
+
+            playable = 0
+            for word_idx in slot.domain.search(1):
+                w = WORDS_BY_LENGTH[slot.length][word_idx]
+                counts: dict[int, int] = {}
+                ok = True
+                for i in open_positions:
+                    tile_idx = ord(w[i]) - ord("A")
+                    new_count = counts.get(tile_idx, 0) + 1
+                    if new_count > tile_bag[tile_idx]:
+                        ok = False
+                        break
+                    counts[tile_idx] = new_count
+                if ok:
+                    playable += 1
+                    if cutoff is not None and playable > cutoff:
+                        return playable
+            return playable
+
+        def _tile_aware_candidate_count(unfilled_count: int) -> int:
+            """Choose how many MRV-ranked slots to consider for tile-aware selection.
+
+            We keep this small early (tiles relatively free) and expand later when tiles become
+            tight, using filled-slot progress as a proxy.
+            """
+            if unfilled_count <= 0:
+                return 0
+            total_slots = len(self.slot_map)
+            filled_slots = total_slots - unfilled_count
+            progress = filled_slots / total_slots if total_slots else 0.0
+
+            if unfilled_count <= TILE_AWARE_MRV_CANDIDATES:
+                return unfilled_count
+
+            if progress < 0.25:
+                k = TILE_AWARE_MRV_CANDIDATES
+            elif progress < 0.60:
+                k = TILE_AWARE_MRV_CANDIDATES * 2
+            else:
+                # Late in search: slots are fewer and tiles are usually tight.
+                k = min(unfilled_count, TILE_AWARE_MRV_MAX_CANDIDATES)
+
+            return min(unfilled_count, max(TILE_AWARE_MRV_CANDIDATES, k))
 
         def _revise(x_pos: SlotPosition, y_pos: SlotPosition) -> bool:
             """Revise x's domain to be arc-consistent with y for the directed arc x -> y.
@@ -666,17 +791,79 @@ class Board:
             return True
 
         # Identify which slots still have '.' cells on the board.
-        unfilled = [pos for pos in self.slot_map if not _slot_filled_on_board(pos)]
-        if not unfilled:
+        if not self._unfilled_slots:
             return self
 
+        # Filled slots is derivable from unfilled slots, and naturally includes forced plays.
+        n_filled = len(self.slot_map) - len(self._unfilled_slots)
+        if n_filled > self.solve_stats.max_filled_slots:
+            self.solve_stats.max_filled_slots = n_filled
+            if self.solve_stats.max_filled_slots > REPORT_HI_SCORE_MIN:
+                print(f"New high: {n_filled} slots filled, current layout:")
+                self.print()
+
+        # Marker to undo any placements performed within this recursion frame (including
+        # forced singleton plays) before backtracking to the caller.
+        frame_mark = _UndoInfo(
+            layout_mark=len(self._undo_trails.layout_changes),
+            tile_mark=len(self._undo_trails.tile_decrements),
+            domain_mark=len(self._undo_trails.domain_changes),
+            filled_mark=len(self._undo_trails.filled_changes),
+        )
+
         # Fail fast if any unfilled slot has no candidates.
-        for pos in unfilled:
+        for pos in self._unfilled_slots:
             if self.slot_map[pos].domain_size <= 0:
                 raise ValueError("Encountered an empty domain during solve.")
 
+        # Play all slots with a single candidate word, fail-fast if any domain becomes empty.
+        made_progress = True
+        while made_progress:
+            made_progress = False
+            for pos in list(self._unfilled_slots):
+                slot = self.slot_map[pos]
+                if slot.domain_size == 1:
+                    word_idx = slot.domain.find(1)
+                    word = WORDS_BY_LENGTH[slot.length][word_idx]
+                    try:
+                        self.place_word(pos, word, tile_bag)
+                        if not _ac3(pos):
+                            raise ValueError("Encountered an empty domain during solve.")
+                    except ValueError:
+                        # Any failure means this recursion frame is inconsistent; revert all
+                        # forced moves made in this frame and backtrack.
+                        self.undo_place_word(frame_mark, tile_bag)
+                        raise
+
+                    made_progress = True
+
+        # Forced plays may have increased filled slots without increasing recursion depth.
+        n_filled = len(self.slot_map) - len(self._unfilled_slots)
+        if n_filled > self.solve_stats.max_filled_slots:
+            self.solve_stats.max_filled_slots = n_filled
+            if self.solve_stats.max_filled_slots > REPORT_HI_SCORE_MIN:
+                print(f"New high: {n_filled} slots filled, current layout:")
+                self.print()
+
         # Select the next slot to fill
-        pos = min(unfilled, key=_slot_sort_key)
+        ranked = sorted(self._unfilled_slots, key=_slot_sort_key)
+        k = _tile_aware_candidate_count(len(self._unfilled_slots))
+        candidates = ranked[:k]
+
+        # Search top candidates for the one with fewest playable words under current tile bag
+        pos = candidates[0]
+        best_playable = _tile_playable_domain_size(pos)
+        for other in candidates[1:]:
+            playable = _tile_playable_domain_size(other, cutoff=best_playable)
+            if playable < best_playable:
+                pos = other
+                best_playable = playable
+            elif playable == best_playable and _slot_sort_key(other) < _slot_sort_key(pos):
+                pos = other
+
+        if best_playable <= 0:
+            self.undo_place_word(frame_mark, tile_bag)
+            raise ValueError(f"No playable words remain for slot at {pos} under current tiles.")
         slot = self.slot_map[pos]
 
         # Try each word in the slot's domain
@@ -685,17 +872,22 @@ class Board:
             try:
                 undo_info = self.place_word(pos, word, tile_bag)
             except ValueError:
+                # Placement failed; try next word
                 continue
 
             try:
                 if not _ac3(pos):
+                    # AC-3 failed; undo and try next word
                     self.undo_place_word(undo_info, tile_bag)
                     continue
                 return self.solve_helper(tile_bag, manhattan_distances, slot_degrees, depth + 1)
             except ValueError:
+                # Recursive call failed; undo and try next word
                 self.undo_place_word(undo_info, tile_bag)
                 continue
 
+        # Failed at current depth; undo forced moves and backtrack.
+        self.undo_place_word(frame_mark, tile_bag)
         raise ValueError(f"No solution found when trying to fill slot at {pos}.")
 
 
