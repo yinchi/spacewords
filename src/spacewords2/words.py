@@ -42,16 +42,23 @@ for w in WORD_LIST:
 
 N_RAREST_LETTERS = 5
 N_RARE_LETTERS = 5
-_LETTER_COUNTS = SortedList(
-    [
-        (ch, sum(1 for word in WORD_LIST if ch in word))
-        for ch in (chr(i) for i in range(ord("A"), ord("Z") + 1))
-    ],
-    key=lambda item: item[1],
-)
-RAREST_LETTERS = {ch for ch, _ in _LETTER_COUNTS[:N_RAREST_LETTERS]}
+
+# Count, for each letter, in how many distinct words it appears.
+# This is intentionally a single pass over WORD_LIST (much faster than scanning WORD_LIST
+# once per letter).
+_counts = [0] * 26
+for w in WORD_LIST:
+    for ch in set(w):
+        idx = ord(ch) - ord("A")
+        if 0 <= idx < 26:
+            _counts[idx] += 1
+
+_letter_counts = [(chr(ord("A") + i), c) for i, c in enumerate(_counts)]
+_letter_counts.sort(key=lambda item: item[1])
+
+RAREST_LETTERS = {ch for ch, _ in _letter_counts[:N_RAREST_LETTERS]}
 RARE_LETTERS = {
-    ch for ch, _ in _LETTER_COUNTS[N_RAREST_LETTERS : N_RAREST_LETTERS + N_RARE_LETTERS]
+    ch for ch, _ in _letter_counts[N_RAREST_LETTERS : N_RAREST_LETTERS + N_RARE_LETTERS]
 }
 
 print(f"Identified rarest letters: {', '.join(sorted(RAREST_LETTERS))}")
