@@ -490,12 +490,10 @@ class Board:
 
             When backtracking, slots to attempt to fill are chosen in order of:
 
-            1. Manhattan distance from `first_pos`.  This "flood-fills" out from the first slot and
-               increases the chance of domain reductions from intersections.  Ensures the slot at
-               `first_pos` is attempted first.  Since distances are pre-computed, we don't need to
-               pass `first_pos` here.
-            2. Fewest remaining possible words in the slot's domain (MRV heuristic).
-            3. Largest number of intersections with other slots (degree heuristic).
+            1. Fewest remaining possible words in the slot's domain (MRV heuristic).
+            2. Largest number of intersections with other slots (degree heuristic).
+            3. Manhattan distance from `first_pos` (tie-break): encourages local propagation but
+                should not override MRV on larger boards.
             4. Across slots before down slots.
             5. Top to bottom, left to right.
 
@@ -509,12 +507,36 @@ class Board:
             if slot is None:
                 raise RuntimeError(f"No slot found at position {pos} during sorting.")
             return (
-                manhattan_distances[pos],
                 slot.domain_size,
                 -slot_degrees[pos],
+                manhattan_distances[pos],
                 pos.direction.value,  # 0 for ACROSS, 1 for DOWN (to prefer ACROSS)
                 pos.start_row * self.n_cols + pos.start_col,
             )
+
+        def _candidate_word_order(pos: SlotPosition) -> list[int]:
+            """Order candidate word indexes for `pos` using an LCV-style heuristic.
+
+            Score a candidate by how many options it leaves in neighboring slots at each
+            intersection (higher is better / less constraining). This is deterministic.
+            """
+            slot = self.slot_map[pos]
+            neighbors = self.constraint_graph.neighbors.get(pos, [])
+            if not neighbors or slot.domain_size <= 1:
+                return list(slot.domain.search(1))
+
+            scored: list[tuple[int, int]] = []
+            for word_idx in slot.domain.search(1):
+                w = WORDS_BY_LENGTH[slot.length][word_idx]
+                score = 0
+                for neighbor_pos, i, j in neighbors:
+                    neighbor = self.slot_map[neighbor_pos]
+                    ch_index = ord(w[i]) - ord("A")
+                    score += (neighbor.domain & WORD_BUCKETS[neighbor.length][j][ch_index]).count()
+                scored.append((score, word_idx))
+
+            scored.sort(key=lambda t: (-t[0], t[1]))
+            return [word_idx for _, word_idx in scored]
 
         def _slot_filled_on_board(pos: SlotPosition) -> bool:
             """Check if the slot at `pos` is already filled on the board (no '.' cells).
@@ -627,7 +649,7 @@ class Board:
         slot = self.slot_map[pos]
 
         # Try each word in the slot's domain
-        for word_idx in slot.domain.search(1):
+        for word_idx in _candidate_word_order(pos):
             word = WORDS_BY_LENGTH[slot.length][word_idx]
             try:
                 undo_info = self.place_word(pos, word, tile_bag)
@@ -739,7 +761,7 @@ def test_board():
 
 def test_solver():
     """Test the solver on a simple board."""
-    grid_rows = 5
+    grid_rows = 6
     grid_cols = 6
     layout = "".join(
         ["." * grid_cols for _ in range(grid_rows)]
