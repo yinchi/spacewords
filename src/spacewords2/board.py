@@ -1,6 +1,6 @@
 """Board representation for the Spacewords game."""
 
-from collections import defaultdict
+from collections import defaultdict, deque
 from typing import NamedTuple
 
 from bitarray import bitarray
@@ -91,6 +91,9 @@ class Board:
         self.intersection_map: defaultdict[tuple[int, int], list[Intersection]] = defaultdict(list)
         """Mapping from cell positions (row, col) to a list of
         (slot_start, index_in_slot) entries."""
+
+        self.boards_checked: int = 0
+        """Number of board states checked during solving."""
 
         # Process rows for ACROSS slots
         for row in range(n_rows):
@@ -250,31 +253,44 @@ class Board:
         changed_domains: set[SlotPosition] = set()
 
         try:
-            # Update board layout, validating against existing letters and tracking tiles used
+            # Cheap pre-check: validate conflicts and ensure the tile bag can cover all new
+            # letters needed for this placement, without mutating anything.
             direction, start_row, start_col = slot.pos
             base = start_row * self.n_cols + start_col
+            pending_writes: list[tuple[int, int]] = []
+            needed_tiles = [0] * 26
+
             for i in range(slot.length):
                 if direction == Direction.ACROSS:
                     idx = base + i
                 else:
                     idx = base + i * self.n_cols
+
                 board_ch = self.layout[idx]
                 word_ch = ord(word[i])
+
                 if board_ch == ord("."):
-                    if tile_bag[word_ch - ord("A")] > 0:
-                        tile_idx = word_ch - ord("A")
-                        tile_bag[tile_idx] -= 1
-                        self._undo_trails.tile_decrements.append(tile_idx)
-                    else:
-                        raise ValueError(f"Not enough tiles to place word '{word}' at {pos}.")
-                    self._undo_trails.layout_changes.append((idx, board_ch))
-                    self.layout[idx] = word_ch
+                    tile_idx = word_ch - ord("A")
+                    needed_tiles[tile_idx] += 1
+                    pending_writes.append((idx, word_ch))
                 elif board_ch != word_ch:
                     raise ValueError(
                         f"Conflict placing word '{word}' at {pos}: "
                         f"board has '{chr(board_ch)}' but word has '{chr(word_ch)}' at "
                         f"position {i}."
                     )
+
+            for tile_idx, count in enumerate(needed_tiles):
+                if count and tile_bag[tile_idx] < count:
+                    raise ValueError(f"Not enough tiles to place word '{word}' at {pos}.")
+
+            # Apply board layout changes + tile decrements (now guaranteed to succeed).
+            for idx, word_ch in pending_writes:
+                tile_idx = word_ch - ord("A")
+                tile_bag[tile_idx] -= 1
+                self._undo_trails.tile_decrements.append(tile_idx)
+                self._undo_trails.layout_changes.append((idx, self.layout[idx]))
+                self.layout[idx] = word_ch
 
             # The first slot we change is the one we are placing the word in.
             if pos not in changed_domains:
@@ -357,17 +373,18 @@ class Board:
 
         Attempts to fill in all slots on the board using words from the word list, subject
         to the constraints of the current board layout and the available tiles.
-        Uses AC3 to reduce domains and backtracking to find a solution.
+        Uses AC3 to reduce domains and backtracking to find a solution.  Stops at the first
+        valid solution found, upon which `self` is the solved board (in-place updates).
 
-        When backtracking, slots to attempt to fill are chosen in order of:
+        When backtracking, slots to attempt to fill are chosen based on `_slot_sort_key()`
+        as defined in `solve_helper()`.
 
-        1. Manhattan distance from `first_pos`.  This "flood-fills" out from the first slot and
-           increases the chance of domain reductions from intersections.  Ensures the slot at
-           `first_pos` is attempted first.
-        2. Fewest remaining possible words in the slot's domain (MRV heuristic).
-        3. Largest number of intersections with other slots (degree heuristic).
-        4. Across slots before down slots.
-        5. Top to bottom, left to right.
+        At each level of recursion, the slot chosen becomes fixed with a word from its domain,
+        and is removed from further consideration.  The domains of intersecting slots are updated
+        accordingly, and AC-3 is run to further reduce domains.  If any slot ends up with an empty
+        domain, the placement is undone and the next word in the domain is attempted.  If all words
+        in the domain are exhausted, backtrack to the previous slot.  If all words in the initial
+        slot are exhausted, the board is unsolvable with the given tiles and a ValueError is raised.
 
         Furthermore, within each slot, words to attempt to place are chosen in order of
         appearance in `WORDS_BY_LENGTH[slot.length]` (filtered by `slot.domain`).  This is dictated
@@ -378,15 +395,9 @@ class Board:
             first_pos: Position of the starting slot to begin solving from.
                 Used to distribute solving attempts in a multi-threaded context.
 
-        Returns:
-            A new Board instance representing the solved board.
-
         Raises:
             ValueError: If the board cannot be solved with the given tiles.
         """
-        # Check that first_pos is valid
-        if first_pos not in self.slot_map:
-            raise ValueError(f"first_pos {first_pos} is not a valid slot position on the board.")
 
         def _manhattan_distance(pos: SlotPosition) -> int:
             """Get the Manhattan distance from `first_pos` to `pos`."""
@@ -399,10 +410,101 @@ class Board:
             for slot_start, slot in self.slot_map.items()
         }
 
+        # Check that first_pos is valid
+        if first_pos not in self.slot_map:
+            raise ValueError(f"first_pos {first_pos} is not a valid slot position on the board.")
+
         manhattan_distances = {pos: _manhattan_distance(pos) for pos in self.slot_map.keys()}
 
+        def _prune_domains_by_tiles() -> None:
+            """One-off pruning using the full tile bag.
+
+            This removes any word from a slot's domain which would require more tiles of
+            some letter than exist in the full tile bag, accounting for already-filled
+            letters on the board (which do not consume tiles).
+
+            This pruning is sound because tile availability only decreases during search.
+            """
+            for pos, slot in self.slot_map.items():
+                if slot.pos is None:
+                    raise RuntimeError("Uninitialized position in slot.")
+
+                direction, start_row, start_col = slot.pos
+                base = start_row * self.n_cols + start_col
+
+                # Effective availability per letter for this slot: tile bag plus letters
+                # already present on the board in this slot.
+                effective = [int(x) for x in tile_bag]
+                for i in range(slot.length):
+                    if direction == Direction.ACROSS:
+                        idx = base + i
+                    else:
+                        idx = base + i * self.n_cols
+                    ch_byte = self.layout[idx]
+                    if ord("A") <= ch_byte <= ord("Z"):
+                        effective[ch_byte - ord("A")] += 1
+
+                to_clear: list[int] = []  # Indexes of unplacable words
+                for word_idx in slot.domain.search(1):
+                    w = WORDS_BY_LENGTH[slot.length][word_idx]
+                    counts: dict[int, int] = {}
+                    ok = True
+                    for ch in w:
+                        ch_byte = ord(ch) - ord("A")
+                        new_count = counts.get(ch_byte, 0) + 1
+                        if new_count > effective[ch_byte]:
+                            ok = False
+                            break
+                        counts[ch_byte] = new_count
+                    if not ok:
+                        to_clear.append(word_idx)
+
+                if to_clear:
+                    for word_idx in to_clear:
+                        slot.domain[word_idx] = False
+                    slot.domain_size -= len(to_clear)
+
+                if slot.domain_size <= 0 or not slot.domain.any():
+                    raise ValueError(
+                        f"No valid words remain for slot at {pos} under the given tile bag."
+                    )
+
+        # One-off pruning before entering recursive solve.
+        _prune_domains_by_tiles()
+
+        self.solve_helper(tile_bag, manhattan_distances, slot_degrees)
+        return self
+
+    def solve_helper(
+        self,
+        tile_bag: TileBag,
+        manhattan_distances: dict[SlotPosition, int],
+        slot_degrees: dict[SlotPosition, int],
+    ) -> "Board":
+        """Recursive helper for `solve()` (TODO)."""
+        if self.boards_checked % 10000 == 0:
+            print(f"Checked {self.boards_checked} board states...")
+
         def _slot_sort_key(pos: SlotPosition) -> tuple[int, int, int, int, int]:
-            """Key function for sorting slots to fill."""
+            """Key function for sorting slots to fill.
+
+            When backtracking, slots to attempt to fill are chosen in order of:
+
+            1. Manhattan distance from `first_pos`.  This "flood-fills" out from the first slot and
+               increases the chance of domain reductions from intersections.  Ensures the slot at
+               `first_pos` is attempted first.  Since distances are pre-computed, we don't need to
+               pass `first_pos` here.
+            2. Fewest remaining possible words in the slot's domain (MRV heuristic).
+            3. Largest number of intersections with other slots (degree heuristic).
+            4. Across slots before down slots.
+            5. Top to bottom, left to right.
+
+            Args:
+                pos: Position of the slot to generate the sort key for.
+
+            Returns:
+                A tuple representing the sort key for the slot at `pos`.
+            """
             slot = self.slot_map.get(pos)
             if slot is None:
                 raise RuntimeError(f"No slot found at position {pos} during sorting.")
@@ -414,7 +516,134 @@ class Board:
                 pos.start_row * self.n_cols + pos.start_col,
             )
 
-        raise NotImplementedError("Board solving not yet implemented.")  # TODO
+        def _slot_filled_on_board(pos: SlotPosition) -> bool:
+            """Check if the slot at `pos` is already filled on the board (no '.' cells).
+
+            If the slot is filled, its domain should already be fixed to a single word, but
+            this is not checked here (only checks the board layout).
+
+            Args:
+                pos: Position of the slot to check.
+
+            Returns:
+                True if the slot is completely filled on the board, False otherwise.
+            """
+            slot = self.slot_map[pos]
+            if slot.pos is None:
+                raise RuntimeError("Uninitialized position in slot.")
+            direction, start_row, start_col = slot.pos
+            base = start_row * self.n_cols + start_col
+            for i in range(slot.length):
+                if direction == Direction.ACROSS:
+                    idx = base + i
+                else:
+                    idx = base + i * self.n_cols
+                if self.layout[idx] == ord("."):
+                    return False
+            return True
+
+        def _revise(x_pos: SlotPosition, y_pos: SlotPosition) -> bool:
+            """Revise x's domain to be arc-consistent with y for the directed arc x -> y.
+
+            Args:
+                x_pos: Position of slot x.
+                y_pos: Position of slot y.
+
+            Returns:
+                True if x's domain was changed, False otherwise.
+            """
+            # Find intersection indices (index i in slot_x is index j in slot_y)
+            ij = self.constraint_graph.arc_map.get((x_pos, y_pos))
+            if ij is None:
+                return False
+            i, j = ij
+            slot_x = self.slot_map[x_pos]
+            slot_y = self.slot_map[y_pos]
+
+            # Which letters can slot y apply at position j?
+            allowed = [False] * 26
+            for ch_index in range(26):
+                if (slot_y.domain & WORD_BUCKETS[slot_y.length][j][ch_index]).any():
+                    allowed[ch_index] = True
+
+            if all(allowed):
+                return False  # Domain unchanged
+
+            # Reduce slot x's domain by removing words whose letter at position i
+            # is not allowed by slot y (at position j).
+            forbidden = zeros(len(slot_x.domain))
+            for ch_index, is_allowed in enumerate(allowed):
+                if not is_allowed:
+                    forbidden |= WORD_BUCKETS[slot_x.length][i][ch_index]
+
+            # Compare new domain to old domain
+            new_domain = slot_x.domain & ~forbidden
+            if new_domain == slot_x.domain:
+                return False  # Domain unchanged
+
+            # Update domain and record undo information
+            self._undo_trails.domain_changes.append((x_pos, slot_x.domain, slot_x.domain_size))
+            slot_x.domain = new_domain
+            slot_x.domain_size = new_domain.count()
+            return True
+
+        def _ac3(seed_pos: SlotPosition) -> bool:
+            """Run AC-3 propagation seeded by a recent assignment at seed_pos.
+
+            Args:
+                seed_pos: Position of the slot that was most recently assigned a word.
+
+            Returns:
+                True if arc-consistency was achieved without empty domains, False otherwise.
+            """
+            q: deque[tuple[SlotPosition, SlotPosition]] = deque()
+            for neighbor_pos, _, _ in self.constraint_graph.neighbors.get(seed_pos, []):
+                q.append((neighbor_pos, seed_pos))
+
+            while q:
+                x_pos, y_pos = q.popleft()
+                if _revise(x_pos, y_pos):
+                    if self.slot_map[x_pos].domain_size == 0:
+                        return False
+                    for z_pos, _, _ in self.constraint_graph.neighbors.get(x_pos, []):
+                        if z_pos != y_pos:
+                            q.append((z_pos, x_pos))
+            return True
+
+        # Identify which slots still have '.' cells on the board.
+        unfilled = [pos for pos in self.slot_map if not _slot_filled_on_board(pos)]
+        if not unfilled:
+            return self
+
+        # Fail fast if any unfilled slot has no candidates.
+        for pos in unfilled:
+            if self.slot_map[pos].domain_size <= 0:
+                raise ValueError("Encountered an empty domain during solve.")
+
+        self.boards_checked += 1
+
+        # Select the next slot to fill
+        pos = min(unfilled, key=_slot_sort_key)
+        slot = self.slot_map[pos]
+
+        # Try each word in the slot's domain
+        for word_idx in slot.domain.search(1):
+            word = WORDS_BY_LENGTH[slot.length][word_idx]
+            try:
+                undo_info = self.place_word(pos, word, tile_bag)
+            except ValueError:
+                continue
+
+            try:
+                if not _ac3(pos):
+                    self.undo_place_word(undo_info, tile_bag)
+                    continue
+                return self.solve_helper(tile_bag, manhattan_distances, slot_degrees)
+            except ValueError:
+                self.undo_place_word(undo_info, tile_bag)
+                continue
+
+        raise ValueError(f"No solution found when trying to fill slot at {pos}.")
 
 
 def test_board():
@@ -508,5 +737,25 @@ def test_board():
     assert tile_bag == tile_bag_for_comparison
 
 
+def test_solver():
+    """Test the solver on a simple board."""
+    grid_rows = 5
+    grid_cols = 6
+    layout = "".join(
+        ["." * grid_cols for _ in range(grid_rows)]
+    )  # empty board of size GRID_ROWS x GRID_COLS
+    board = Board(layout, grid_rows, grid_cols)
+
+    tile_bag = create_tile_bag("ABCDEFGHIJKLMNOPQRSTUVWXYZ" * grid_rows)
+
+    try:
+        solved_board = board.solve(tile_bag, SlotPosition(Direction.ACROSS, 0, 0))
+        print("Solved board:")
+        solved_board.print()
+        print(f"Boards checked: {solved_board.boards_checked}")
+    except ValueError:
+        print("No solution found.")
+
+
 if __name__ == "__main__":
-    test_board()
+    test_solver()
