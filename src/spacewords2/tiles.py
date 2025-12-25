@@ -24,13 +24,11 @@ def create_tile_bag(tiles: str) -> TileBag:
     """
     bag = array("B", [0] * 26)  # Array of 26 unsigned 1-byte integers for A-Z
 
-    # For type safety, limit the length of the input string
-    if len(tiles) >= 256:
-        raise ValueError("Tile string too long; must be less than 256 characters.")
-
     for ch in tiles.upper():
         if "A" <= ch <= "Z":
             index = ord(ch) - ord("A")
+            if bag[index] == 255:
+                raise ValueError(f"Too many tiles of type '{ch}'; maximum is 255.")
             bag[index] += 1
         else:
             raise ValueError(f"Invalid tile character: {ch}")

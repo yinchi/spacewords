@@ -1,6 +1,9 @@
 """Board representation for the Spacewords game."""
 
+import sys
 from collections import defaultdict, deque
+from dataclasses import dataclass
+from time import time
 from typing import NamedTuple
 
 from bitarray import bitarray
@@ -8,6 +11,7 @@ from bitarray.util import zeros
 
 from spacewords2.slot import Direction, Intersection, Slot, SlotPosition
 from spacewords2.tiles import TileBag, create_tile_bag
+from spacewords2.util import int_comma, time_str
 from spacewords2.words import WORD_BUCKETS, WORD_INDEXES, WORDS_BY_LENGTH
 
 
@@ -62,6 +66,20 @@ class ConstraintGraph(NamedTuple):
     """Mapping from pairs of slot positions to their intersection indices."""
 
 
+@dataclass
+class SolverStats:
+    """Statistics collected during solving."""
+
+    boards_checked: int = 0
+    """Number of board states checked during solving."""
+
+    start_time: float = time()
+    """Timestamp when solving started."""
+
+    max_depth_reached: int = 0
+    """Maximum recursion depth reached during solving."""
+
+
 class Board:
     """Represents the game board."""
 
@@ -92,8 +110,8 @@ class Board:
         """Mapping from cell positions (row, col) to a list of
         (slot_start, index_in_slot) entries."""
 
-        self.boards_checked: int = 0
-        """Number of board states checked during solving."""
+        self.solve_stats: SolverStats = SolverStats()
+        """Statistics collected during solving."""
 
         # Process rows for ACROSS slots
         for row in range(n_rows):
@@ -472,7 +490,7 @@ class Board:
         # One-off pruning before entering recursive solve.
         _prune_domains_by_tiles()
 
-        self.solve_helper(tile_bag, manhattan_distances, slot_degrees)
+        self.solve_helper(tile_bag, manhattan_distances, slot_degrees, depth=0)
         return self
 
     def solve_helper(
@@ -480,10 +498,22 @@ class Board:
         tile_bag: TileBag,
         manhattan_distances: dict[SlotPosition, int],
         slot_degrees: dict[SlotPosition, int],
+        depth: int,
     ) -> "Board":
         """Recursive helper for `solve()` (TODO)."""
-        if self.boards_checked % 10000 == 0:
-            print(f"Checked {self.boards_checked} board states...")
+        self.solve_stats.boards_checked += 1
+
+        # Update max depth reached
+        self.solve_stats.max_depth_reached = max(self.solve_stats.max_depth_reached, depth)
+
+        # Display progress every 10,000 boards checked
+        if self.solve_stats.boards_checked % 10000 == 0:
+            elapsed_time = time() - self.solve_stats.start_time
+            print(
+                f"Checked {int_comma(self.solve_stats.boards_checked)} board states "
+                f"after {time_str(elapsed_time)}; max depth {self.solve_stats.max_depth_reached}, "
+                f"current depth {depth}."
+            )
 
         def _slot_sort_key(pos: SlotPosition) -> tuple[int, int, int, int, int]:
             """Key function for sorting slots to fill.
@@ -642,8 +672,6 @@ class Board:
             if self.slot_map[pos].domain_size <= 0:
                 raise ValueError("Encountered an empty domain during solve.")
 
-        self.boards_checked += 1
-
         # Select the next slot to fill
         pos = min(unfilled, key=_slot_sort_key)
         slot = self.slot_map[pos]
@@ -660,7 +688,7 @@ class Board:
                 if not _ac3(pos):
                     self.undo_place_word(undo_info, tile_bag)
                     continue
-                return self.solve_helper(tile_bag, manhattan_distances, slot_degrees)
+                return self.solve_helper(tile_bag, manhattan_distances, slot_degrees, depth + 1)
             except ValueError:
                 self.undo_place_word(undo_info, tile_bag)
                 continue
@@ -759,25 +787,31 @@ def test_board():
     assert tile_bag == tile_bag_for_comparison
 
 
-def test_solver():
-    """Test the solver on a simple board."""
-    grid_rows = 6
-    grid_cols = 6
+def test_solver(grid_rows: int, grid_cols: int, tile_copies: int):
+    """Test the solver on an empty board.
+
+    Args:
+        grid_rows: Number of rows in the board.
+        grid_cols: Number of columns in the board.
+        tile_copies: Number of copies of each letter tile A-Z in the tile bag.
+    """
     layout = "".join(
         ["." * grid_cols for _ in range(grid_rows)]
     )  # empty board of size GRID_ROWS x GRID_COLS
     board = Board(layout, grid_rows, grid_cols)
 
-    tile_bag = create_tile_bag("ABCDEFGHIJKLMNOPQRSTUVWXYZ" * grid_rows)
+    tile_bag = create_tile_bag("ABCDEFGHIJKLMNOPQRSTUVWXYZ" * tile_copies)
 
     try:
         solved_board = board.solve(tile_bag, SlotPosition(Direction.ACROSS, 0, 0))
         print("Solved board:")
         solved_board.print()
-        print(f"Boards checked: {solved_board.boards_checked}")
+        print(f"Boards checked: {int_comma(solved_board.solve_stats.boards_checked)}")
+        print(f"Time taken: {time_str(time() - solved_board.solve_stats.start_time)}")
     except ValueError:
         print("No solution found.")
 
 
 if __name__ == "__main__":
-    test_solver()
+    n_rows, n_cols, n_copies = map(int, sys.argv[1:4])
+    test_solver(n_rows, n_cols, n_copies)
