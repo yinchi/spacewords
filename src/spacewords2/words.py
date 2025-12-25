@@ -65,19 +65,7 @@ print(f"Identified rarest letters: {', '.join(sorted(RAREST_LETTERS))}")
 print(f"Identified rare letters: {', '.join(sorted(RARE_LETTERS))}")
 
 
-def word_sort_key(word: str) -> tuple[int, str]:
-    """Key function for sorting words within each length bucket.
-
-    Awards words with more rare letters a higher priority, as these will be more useful in
-    restricting the domains of intersecting slots on the board.
-    """
-    rare_count = sum(2 for ch in word if ch in RAREST_LETTERS) + sum(
-        1 for ch in word if ch in RARE_LETTERS
-    )
-    return (-rare_count, word)
-
-
-WORDS_BY_LENGTH = [SortedList(bucket, key=word_sort_key) for bucket in _tmp]
+WORDS_BY_LENGTH = [SortedList(bucket) for bucket in _tmp]
 del _tmp
 
 WORD_INDEXES = {}
