@@ -41,6 +41,7 @@ for w in WORD_LIST:
     _tmp[len(w)].append(w)
 
 N_RAREST_LETTERS = 5
+N_RARE_LETTERS = 5
 _LETTER_COUNTS = SortedList(
     [
         (ch, sum(1 for word in WORD_LIST if ch in word))
@@ -48,8 +49,12 @@ _LETTER_COUNTS = SortedList(
     ],
     key=lambda item: item[1],
 )
-RARE_LETTERS = {ch for ch, _ in _LETTER_COUNTS[:N_RAREST_LETTERS]}
+RAREST_LETTERS = {ch for ch, _ in _LETTER_COUNTS[:N_RAREST_LETTERS]}
+RARE_LETTERS = {
+    ch for ch, _ in _LETTER_COUNTS[N_RAREST_LETTERS : N_RAREST_LETTERS + N_RARE_LETTERS]
+}
 
+print(f"Identified rarest letters: {', '.join(sorted(RAREST_LETTERS))}")
 print(f"Identified rare letters: {', '.join(sorted(RARE_LETTERS))}")
 
 
@@ -59,7 +64,9 @@ def word_sort_key(word: str) -> tuple[int, str]:
     Awards words with more rare letters a higher priority, as these will be more useful in
     restricting the domains of intersecting slots on the board.
     """
-    rare_count = sum(1 for ch in word if ch in RARE_LETTERS)
+    rare_count = sum(2 for ch in word if ch in RAREST_LETTERS) + sum(
+        1 for ch in word if ch in RARE_LETTERS
+    )
     return (-rare_count, word)
 
 
