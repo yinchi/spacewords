@@ -39,32 +39,6 @@ MAX_WORD_LENGTH = max(len(word) for word in WORD_LIST) if WORD_LIST else 0
 _tmp: list[list[str]] = [[] for _ in range(MAX_WORD_LENGTH + 1)]
 for w in WORD_LIST:
     _tmp[len(w)].append(w)
-
-N_RAREST_LETTERS = 5
-N_RARE_LETTERS = 5
-
-# Count, for each letter, in how many distinct words it appears.
-# This is intentionally a single pass over WORD_LIST (much faster than scanning WORD_LIST
-# once per letter).
-_counts = [0] * 26
-for w in WORD_LIST:
-    for ch in set(w):
-        idx = ord(ch) - ord("A")
-        if 0 <= idx < 26:
-            _counts[idx] += 1
-
-_letter_counts = [(chr(ord("A") + i), c) for i, c in enumerate(_counts)]
-_letter_counts.sort(key=lambda item: item[1])
-
-RAREST_LETTERS = {ch for ch, _ in _letter_counts[:N_RAREST_LETTERS]}
-RARE_LETTERS = {
-    ch for ch, _ in _letter_counts[N_RAREST_LETTERS : N_RAREST_LETTERS + N_RARE_LETTERS]
-}
-
-print(f"Identified rarest letters: {', '.join(sorted(RAREST_LETTERS))}")
-print(f"Identified rare letters: {', '.join(sorted(RARE_LETTERS))}")
-
-
 WORDS_BY_LENGTH = [SortedList(bucket) for bucket in _tmp]
 del _tmp
 
