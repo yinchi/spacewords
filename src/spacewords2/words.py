@@ -35,6 +35,18 @@ def load_wordlist() -> SortedList[str]:
 WORD_LIST = load_wordlist()
 MAX_WORD_LENGTH = max(len(word) for word in WORD_LIST) if WORD_LIST else 0
 
+# Dictionary-based letter frequencies/rarity weights (used by solver heuristics).
+# Frequency counts total occurrences across the entire dictionary.
+LETTER_FREQ: list[int] = [0] * 26
+for _w in WORD_LIST:
+    for _ch in _w:
+        LETTER_FREQ[ord(_ch) - ord("A")] += 1
+_max_freq = max(LETTER_FREQ) if LETTER_FREQ else 1
+print(f"Letter frequencies: {LETTER_FREQ}")
+LETTER_RARITY_WEIGHT: list[float] = [round(((f + 1) / _max_freq) ** -0.5, 0) for f in LETTER_FREQ]
+print(f"Letter rarity weights: {LETTER_RARITY_WEIGHT}")
+del _w, _ch, _max_freq
+
 # Build buckets in one pass (still sorted, but without MAX_WORD_LENGTH full scans)
 _tmp: list[list[str]] = [[] for _ in range(MAX_WORD_LENGTH + 1)]
 for w in WORD_LIST:

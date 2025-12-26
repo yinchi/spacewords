@@ -33,3 +33,17 @@ def create_tile_bag(tiles: str) -> TileBag:
         else:
             raise ValueError(f"Invalid tile character: {ch}")
     return bag
+
+def tile_bag_to_string(tile_bag: TileBag) -> str:
+    """Convert a tile bag to a string representation.
+
+    Args:
+        tile_bag: An array of 26 integers representing counts of tiles A-Z.
+
+    Returns:
+        A string where each character represents a tile in the bag.
+    """
+    tile_str = ""
+    for i in range(26):
+        tile_str += chr(ord("A") + i) * tile_bag[i]
+    return tile_str

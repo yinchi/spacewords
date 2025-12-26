@@ -2,7 +2,7 @@
 
 from time import time
 
-from spacewords2.board import Board, ValueError
+from spacewords2.board import Board
 from spacewords2.slot import Direction, SlotPosition
 from spacewords2.tiles import create_tile_bag
 from spacewords2.util import int_comma, time_str
@@ -10,7 +10,7 @@ from spacewords2.util import int_comma, time_str
 NROWS = 8
 NCOLS = 9
 LAYOUT = """
-     F L A P J A C K S
+F L A P J A C K S
  . . . . # . . # .
  . . # . . . . . .
  . . . . . # . . .
@@ -51,7 +51,7 @@ n_slots = len(board.slot_map)
 print(f"Number of slots identified: {n_slots}")
 
 try:
-    solved_board = board.solve(tile_bag, SlotPosition(Direction.DOWN, 0, 8))
+    solved_board = board.solve(tile_bag, first_pos=SlotPosition(Direction.DOWN, 0, 8))
     print("Solved board:")
     solved_board.print()
     print(f"Boards checked: {int_comma(solved_board.solve_stats.boards_checked)}")

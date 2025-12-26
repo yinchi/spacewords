@@ -1,23 +1,25 @@
 """Board representation for the Spacewords game."""
 
+import random
 import sys
+from array import array
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from time import time
 from typing import NamedTuple
 
 from bitarray import bitarray
-from bitarray.util import zeros
+from bitarray.util import count_and, zeros
 
 from spacewords2.slot import Direction, Intersection, Slot, SlotPosition
-from spacewords2.tiles import TileBag, create_tile_bag
+from spacewords2.tiles import TileBag, create_tile_bag, tile_bag_to_string
 from spacewords2.util import int_comma, time_str
-from spacewords2.words import WORD_BUCKETS, WORD_INDEXES, WORDS_BY_LENGTH
+from spacewords2.words import LETTER_RARITY_WEIGHT, WORD_BUCKETS, WORD_INDEXES, WORDS_BY_LENGTH
 
-REPORT_INTERVAL = 10_000
+REPORT_INTERVAL = 100_000
 """Interval (in number of boards checked) for reporting progress during solving."""
 
-REPORT_HI_SCORE_MIN = 10
+REPORT_HI_SCORE_MIN = 1
 """Report new best board only if at least this many slots are filled."""
 
 TILE_AWARE_MRV_CANDIDATES = 8
@@ -25,6 +27,9 @@ TILE_AWARE_MRV_CANDIDATES = 8
 
 TILE_AWARE_MRV_MAX_CANDIDATES = 32
 """Maximum number of candidates to consider for tile-aware MRV (caps overhead)."""
+
+RANDOMIZE_TIES = False
+"""Whether to randomize slot-selection ties during solving."""
 
 
 class _UndoInfo(NamedTuple):
@@ -45,7 +50,7 @@ class _UndoTrails(NamedTuple):
     layout_changes: list[tuple[int, int]]
     """List of (index, old_byte) tuples representing changes to the board layout."""
 
-    tile_decrements: list[int]
+    tile_decrements: array[int]
     """List of tile indices that were decremented in the tile bag."""
 
     domain_changes: list[tuple[SlotPosition, bitarray, int]]
@@ -102,12 +107,6 @@ class SolverStats:
     """Maximum number of filled slots reached during solving."""
 
 
-class ValueError(Exception):
-    """Exception raised when the board is determined to be unsolvable."""
-
-    pass
-
-
 class Board:
     """Represents the game board."""
 
@@ -132,10 +131,14 @@ class Board:
         """Mapping from positions to Slot objects."""
 
         # Undo trails (used by place_word / undo_place_word)
-        self._undo_trails: _UndoTrails = _UndoTrails([], [], [], [])
+        self._undo_trails: _UndoTrails = _UndoTrails([], array("I"), [], [])
 
         # Cached board indices for each slot (hot-path optimization).
         self._slot_cell_idxs: dict[SlotPosition, tuple[int, ...]] = {}
+
+        # Cached slot-relative indices which are not intersections (static).
+        # Used by heuristics to prefer placing rare letters in low-constraint cells.
+        self._slot_non_intersect_idxs: dict[SlotPosition, tuple[int, ...]] = {}
 
         # Tracks which slots are not yet fully filled on the board (contain at least one '.')
         self._unfilled_slots: set[SlotPosition] = set()
@@ -205,6 +208,12 @@ class Board:
                         raise RuntimeError("Uninitialized position in other_slot.")
                     if intersection.other_slot.pos.direction == other_direction:
                         slot.intersections[i] = intersection
+
+        # Cache non-intersection positions (slot-relative indices)
+        for pos, slot in self.slot_map.items():
+            self._slot_non_intersect_idxs[pos] = tuple(
+                i for i, inter in enumerate(slot.intersections) if inter is None
+            )
 
         self.constraint_graph = self._build_constraint_graph()
         """Precomputed constraint graph for the board.
@@ -470,7 +479,14 @@ class Board:
             else:
                 self._unfilled_slots.discard(pos)
 
-    def solve(self, tile_bag: TileBag, first_pos: SlotPosition) -> "Board":
+    def solve(
+        self,
+        tile_bag: TileBag,
+        first_pos: SlotPosition,
+        *,
+        randomize_ties: bool = RANDOMIZE_TIES,
+        seed: int | None = None,
+    ) -> "Board":
         """Solve the board using the available tiles in the tile bag (TODO).
 
         Attempts to fill in all slots on the board using words from the word list, subject
@@ -496,19 +512,29 @@ class Board:
             tile_bag: The current tile bag representing available tiles.
             first_pos: Position of the starting slot to begin solving from.
                 Used to distribute solving attempts in a multi-threaded context.
+            randomize_ties: If True, break slot-selection ties using a stable random value per
+                slot (seeded by `seed`) instead of deterministic direction/position ordering.
+                This can diversify search and avoid repeatedly exploring the same subtree.
+            seed: Optional RNG seed used when `randomize_ties` is True.
 
         Raises:
             ValueError: If the board cannot be solved with the given tiles.
         """
+        slot_tiebreak: dict[SlotPosition, float] | None = None
+        if randomize_ties:
+            rng = random.Random(seed)
+            # Stable per-slot tiebreak values for the entire solve.
+            slot_tiebreak = {pos: rng.random() for pos in self.slot_map}
 
         def _manhattan_distance(pos: SlotPosition) -> int:
             """Get the Manhattan distance from `first_pos` to `pos`."""
             r1, c1 = pos.start_row, pos.start_col
             r2, c2 = first_pos.start_row, first_pos.start_col
-            return abs(r1 - r2) + abs(c1 - c2)
+            return abs(r1 - r2) if pos.direction == Direction.ACROSS else abs(c1 - c2)
 
         slot_degrees: dict[SlotPosition, int] = {
-            slot_start: sum(1 for inter in slot.intersections if inter is not None)
+            slot_start: slot.length
+            # slot_start: sum(1 for inter in slot.intersections if inter is not None)
             for slot_start, slot in self.slot_map.items()
         }
 
@@ -539,7 +565,7 @@ class Board:
                     if ord("A") <= ch_byte <= ord("Z"):
                         effective[ch_byte - ord("A")] += 1
 
-                to_clear: list[int] = []  # Indexes of unplacable words
+                to_clear: array[int] = array("I")  # Indexes of unplacable words
                 for word_idx in slot.domain.search(1):
                     w = WORDS_BY_LENGTH[slot.length][word_idx]
                     counts: dict[int, int] = {}
@@ -575,10 +601,18 @@ class Board:
             return self
 
         try:
-            self.solve_helper(tile_bag, manhattan_distances, slot_degrees, depth=0)
+            self.solve_helper(
+                tile_bag,
+                manhattan_distances,
+                slot_degrees,
+                depth=0,
+                slot_tiebreak=slot_tiebreak,
+                first_pos=first_pos,
+            )
             return self
         except ValueError as e:
             # ValueError has propagated up to the top level: no solution found
+            print(e, file=sys.stderr)
             raise ValueError("No solution found for the board with the given tile bag.") from e
 
     def solve_helper(
@@ -587,6 +621,8 @@ class Board:
         manhattan_distances: dict[SlotPosition, int],
         slot_degrees: dict[SlotPosition, int],
         depth: int,
+        slot_tiebreak: dict[SlotPosition, float] | None = None,
+        first_pos: SlotPosition | None = None,
     ) -> "Board":
         """Recursive helper for `solve()` (TODO)."""
         self.solve_stats.boards_checked += 1
@@ -604,17 +640,8 @@ class Board:
                 flush=True,
             )
 
-        def _slot_sort_key(pos: SlotPosition) -> tuple[int, int, int, int, int]:
+        def _slot_sort_key(pos: SlotPosition) -> tuple[int, int, int, float]:
             """Key function for sorting slots to fill.
-
-            When backtracking, slots to attempt to fill are chosen in order of:
-
-            1. Largest number of intersections with other slots (degree heuristic).
-            2. Fewest remaining possible words in the slot's domain (MRV heuristic).
-            3. Manhattan distance from `first_pos` (tie-break): encourages local propagation but
-                should not override MRV on larger boards.
-            4. Across slots before down slots.
-            5. Top to bottom, left to right.
 
             Args:
                 pos: Position of the slot to generate the sort key for.
@@ -625,37 +652,95 @@ class Board:
             slot = self.slot_map.get(pos)
             if slot is None:
                 raise RuntimeError(f"No slot found at position {pos} during sorting.")
+
+            rand = 0.0 if slot_tiebreak is None else slot_tiebreak[pos]
             return (
-                -slot_degrees[pos],
-                slot.domain_size,
-                manhattan_distances[pos],
-                pos.direction.value,  # 0 for ACROSS, 1 for DOWN (to prefer ACROSS)
-                pos.start_row * self.n_cols + pos.start_col,
+                (
+                    -slot_degrees[pos],
+                    slot.domain_size,
+                    0, #manhattan_distances[pos],
+                    rand,  # Is 0.0 if randomization is disabled
+                )
+                if depth < 4
+                else (
+                    slot.domain_size,
+                    -slot_degrees[pos],
+                    0,  # manhattan_distances[pos],
+                    rand,  # Is 0.0 if randomization is disabled
+                )
             )
 
-        def _candidate_word_order(pos: SlotPosition) -> list[int]:
-            """Order candidate word indexes for `pos` using an LCV-style heuristic.
+        def _candidate_word_order(pos: SlotPosition) -> array[int]:
+            """Order candidate word indexes for `pos`.
 
-            Score a candidate by how many options it leaves in neighboring slots at each
-            intersection (higher is better / less constraining). This is deterministic.
+            Prioritize words which place dictionary-rarer letters earlier.
+            Non-intersection placements are weighted higher than intersections.
+            This is a value-ordering heuristic only (does not prune domains).
             """
             slot = self.slot_map[pos]
-            neighbors = self.constraint_graph.neighbors.get(pos, [])
-            if not neighbors or slot.domain_size <= 1:
-                return list(slot.domain.search(1))
 
-            scored: list[tuple[int, int]] = []
+            if slot.domain_size <= 1:
+                return array("I", slot.domain.search(1))
+
+            # Only score letters that would actually be placed (i.e., open board cells).
+            # Weight non-intersection placements higher than intersections.
+            cell_idxs = self._slot_cell_idxs[pos]
+            open_positions: list[tuple[int, int]] = []
+            dot = ord(".")
+            for i in range(slot.length):
+                if self.layout[cell_idxs[i]] != dot:
+                    continue
+                weight = (
+                    2
+                    if slot.intersections[i] is None #or slot.intersections[i].other_slot.fixed
+                    else 1
+                )
+                open_positions.append((i, weight))
+            if not open_positions:
+                return array("I", slot.domain.search(1))
+
+            ord_a = ord("A")
+
+            # Secondary value ordering heuristic: prefer words that keep intersecting
+            # slots flexible under current domains (sum of resulting domain sizes).
+            #
+            # Efficient implementation: per intersection, precompute a 26-entry table
+            # of |D_y ∩ bucket(letter)| once, then score each word via O(#inters) lookups.
+            active_intersections: list[tuple[int, list[int]]] = []
+            for i in range(slot.length):
+                if self.layout[cell_idxs[i]] != dot:
+                    continue  # Not placing a tile here; this word doesn't constrain neighbors.
+                inter = slot.intersections[i]
+                if inter is None:
+                    continue
+                other_slot = inter.other_slot
+                j = inter.index_in_other_slot
+                table = [0] * 26
+                buckets = WORD_BUCKETS[other_slot.length][j]
+                other_domain = other_slot.domain
+                for ch_index in range(26):
+                    table[ch_index] = count_and(other_domain, buckets[ch_index])
+                active_intersections.append((i, table))
+
+            scored: list[tuple[float, int, int]] = []
             for word_idx in slot.domain.search(1):
                 w = WORDS_BY_LENGTH[slot.length][word_idx]
-                score = 0
-                for neighbor_pos, i, j in neighbors:
-                    neighbor = self.slot_map[neighbor_pos]
-                    ch_index = ord(w[i]) - ord("A")
-                    score += (neighbor.domain & WORD_BUCKETS[neighbor.length][j][ch_index]).count()
-                scored.append((score, word_idx))
+                score = 1.0
+                for i, weight in open_positions:
+                    idx = ord(w[i]) - ord_a
+                    score += weight * tile_bag[idx] * LETTER_RARITY_WEIGHT[idx]
 
-            scored.sort(key=lambda t: (-t[0], t[1]))
-            return [word_idx for _, word_idx in scored]
+                # Keep-flexibility heuristic: larger is better.
+                flexibility = 0
+                for i, table in active_intersections:
+                    flexibility += table[ord(w[i]) - ord_a]
+
+                scored.append((score, flexibility, word_idx))
+
+            key = lambda t: (-t[1], -t[0], t[2]) if depth < 3 else (-t[0], -t[1], t[2])
+
+            scored.sort(key=key)
+            return array("I", (word_idx for _, _, word_idx in scored))
 
         def _tile_playable_domain_size(pos: SlotPosition, cutoff: int | None = None) -> int:
             """Count how many domain words are playable under the current tile bag.
@@ -712,15 +797,17 @@ class Board:
             if unfilled_count <= TILE_AWARE_MRV_CANDIDATES:
                 return unfilled_count
 
-            if progress < 0.25:
+            if progress < 0.2:
+                k = 1
+            elif progress < 0.4:
                 k = TILE_AWARE_MRV_CANDIDATES
             elif progress < 0.60:
                 k = TILE_AWARE_MRV_CANDIDATES * 2
             else:
                 # Late in search: slots are fewer and tiles are usually tight.
-                k = min(unfilled_count, TILE_AWARE_MRV_MAX_CANDIDATES)
+                k = unfilled_count  # Consider all
 
-            return min(unfilled_count, max(TILE_AWARE_MRV_CANDIDATES, k))
+            return min(unfilled_count, k)
 
         def _revise(x_pos: SlotPosition, y_pos: SlotPosition) -> bool:
             """Revise x's domain to be arc-consistent with y for the directed arc x -> y.
@@ -801,6 +888,7 @@ class Board:
             if self.solve_stats.max_filled_slots > REPORT_HI_SCORE_MIN:
                 print(f"New high: {n_filled} slots filled, current layout:")
                 self.print()
+                print(f"Remaining tiles: {tile_bag_to_string(tile_bag)}")
 
         # Marker to undo any placements performed within this recursion frame (including
         # forced singleton plays) before backtracking to the caller.
@@ -844,26 +932,31 @@ class Board:
             if self.solve_stats.max_filled_slots > REPORT_HI_SCORE_MIN:
                 print(f"New high: {n_filled} slots filled, current layout:")
                 self.print()
+                print(f"Remaining tiles: {tile_bag_to_string(tile_bag)}")
 
         # Select the next slot to fill
-        ranked = sorted(self._unfilled_slots, key=_slot_sort_key)
-        k = _tile_aware_candidate_count(len(self._unfilled_slots))
-        candidates = ranked[:k]
+        if depth == 0 and first_pos is not None and first_pos in self._unfilled_slots:
+            pos = first_pos
+        else:
+            ranked = sorted(self._unfilled_slots, key=_slot_sort_key)
+            k = _tile_aware_candidate_count(len(self._unfilled_slots))
+            candidates = ranked[:k]
 
-        # Search top candidates for the one with fewest playable words under current tile bag
-        pos = candidates[0]
-        best_playable = _tile_playable_domain_size(pos)
-        for other in candidates[1:]:
-            playable = _tile_playable_domain_size(other, cutoff=best_playable)
-            if playable < best_playable:
-                pos = other
-                best_playable = playable
-            elif playable == best_playable and _slot_sort_key(other) < _slot_sort_key(pos):
-                pos = other
+            # Search top candidates for the one with fewest playable words under current tile bag
+            pos = candidates[0]
+            best_playable = _tile_playable_domain_size(pos)
+            for other in candidates[1:]:
+                playable = _tile_playable_domain_size(other, cutoff=best_playable)
+                if playable < best_playable:
+                    pos = other
+                    best_playable = playable
+                elif playable == best_playable and _slot_sort_key(other) < _slot_sort_key(pos):
+                    pos = other
 
-        if best_playable <= 0:
-            self.undo_place_word(frame_mark, tile_bag)
-            raise ValueError(f"No playable words remain for slot at {pos} under current tiles.")
+            if best_playable <= 0:
+                self.undo_place_word(frame_mark, tile_bag)
+                raise ValueError(f"No playable words remain for slot at {pos} under current tiles.")
+
         slot = self.slot_map[pos]
 
         # Try each word in the slot's domain
@@ -871,6 +964,8 @@ class Board:
             word = WORDS_BY_LENGTH[slot.length][word_idx]
             try:
                 undo_info = self.place_word(pos, word, tile_bag)
+                if depth == 0:
+                    print(f"Playing initial word '{word}' at {pos}...")
             except ValueError:
                 # Placement failed; try next word
                 continue
