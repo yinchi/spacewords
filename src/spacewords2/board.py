@@ -4,7 +4,7 @@ import random
 import sys
 from array import array
 from collections import defaultdict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from time import time
 from typing import NamedTuple
 
@@ -16,10 +16,10 @@ from spacewords2.tiles import TileBag, create_tile_bag, tile_bag_to_string
 from spacewords2.util import int_comma, time_str
 from spacewords2.words import LETTER_RARITY_WEIGHT, WORD_BUCKETS, WORD_INDEXES, WORDS_BY_LENGTH
 
-REPORT_INTERVAL = 100_000
+REPORT_INTERVAL = 1_000
 """Interval (in number of boards checked) for reporting progress during solving."""
 
-REPORT_HI_SCORE_MIN = 1
+REPORT_HI_SCORE_MIN = 10
 """Report new best board only if at least this many slots are filled."""
 
 TILE_AWARE_MRV_CANDIDATES = 8
@@ -27,6 +27,57 @@ TILE_AWARE_MRV_CANDIDATES = 8
 
 TILE_AWARE_MRV_MAX_CANDIDATES = 32
 """Maximum number of candidates to consider for tile-aware MRV (caps overhead)."""
+
+PLAYABLE_SORT_TILE_ENTROPY_MAX = 9
+"""When distinct remaining letters <= this, include playable-count in slot sort key."""
+
+PLAYABLE_SORT_DEPTH = 2
+"""Depth at which we start including playable-count in slot sort key."""
+
+PLAYABLE_SORT_MIN_UNFILLED = 8
+"""Minimum unfilled-slot threshold for enabling playable-count in slot sort key."""
+
+PLAYABLE_SORT_FRACTION = 0.25
+"""Enable playable-count when unfilled slots <= fraction of total slots."""
+
+PLAYABLE_SORT_CUTOFF = 64
+"""Early-exit cutoff for playable-count used in slot sorting.
+
+When included in `_slot_sort_key`, we only need a relative notion of "small" vs "large".
+Computing the exact playable count can be expensive (scan the entire domain), so we cap the
+work here and compute exact playable counts only for the small final candidate set.
+"""
+
+UNPLAYABLE_TILE_CHECK_DEPTH = 0
+"""Depth at which we start failing fast on unplayable remaining tiles.
+
+This check is only applied when the remaining tile count exactly equals the number of
+remaining '.' cells on the board (i.e., every remaining tile must be placed).
+"""
+
+TILE_CAPACITY_CHECK_TILE_ENTROPY_MAX = 9
+"""Run the count-based tile-capacity check when distinct remaining letters <= this."""
+
+TILE_CAPACITY_CHECK_DEPTH = 0
+"""Run the count-based tile-capacity check starting at this depth (even if entropy is high)."""
+
+TILE_DOMAIN_PRUNE_TILE_ENTROPY_MAX = 8
+"""Enable tile-based domain pruning when distinct remaining letters <= this."""
+
+TILE_DOMAIN_PRUNE_DEPTH = 0
+"""Enable tile-based domain pruning at/after this depth even if entropy is higher."""
+
+TILE_DOMAIN_PRUNE_MIN_DOMAIN = 32
+"""Only tile-prune slots with at least this many candidates (reduces overhead)."""
+
+TILE_DOMAIN_PRUNE_GLOBAL = True
+"""If True, apply tile-based domain pruning to all unfilled slots during AC-3.
+
+If False, tile pruning is only applied opportunistically to slots reached by AC-3 propagation.
+"""
+
+TILE_DOMAIN_PRUNE_GLOBAL_FREQ = 1
+"""Frequency (in recursion depth) to run global tile-based domain pruning."""
 
 RANDOMIZE_TIES = False
 """Whether to randomize slot-selection ties during solving."""
@@ -105,6 +156,9 @@ class SolverStats:
 
     max_filled_slots: int = 0
     """Maximum number of filled slots reached during solving."""
+
+    depth_hit: array[int] = field(default_factory=lambda: array("I", [0] * 64))
+    """Number of times each recursion depth was reached."""
 
 
 class Board:
@@ -593,6 +647,20 @@ class Board:
         # One-off pruning before entering recursive solve.
         _prune_domains_by_tiles()
 
+        # Determine once whether this is a "must play all tiles" puzzle.
+        #
+        # Let O be the number of '.' cells on the board. Solving requires placing exactly O
+        # tiles (fixed letters do not consume tiles). Since we only ever place letters into
+        # '.', both O and the remaining tile count decrease together.
+        required_tiles = self.layout.count(ord("."))
+        available_tiles = sum(int(x) for x in tile_bag)
+        if available_tiles < required_tiles:
+            raise ValueError(
+                "Not enough tiles to fill the board: "
+                f"need {required_tiles}, have {available_tiles}."
+            )
+        must_use_all_tiles = available_tiles == required_tiles
+
         # Initial filled slots (tracked incrementally from board layout).
         initial_filled = len(self.slot_map) - len(self._unfilled_slots)
         print(f"Initial filled slots: {initial_filled} / {len(self.slot_map)}")
@@ -608,6 +676,7 @@ class Board:
                 depth=0,
                 slot_tiebreak=slot_tiebreak,
                 first_pos=first_pos,
+                must_use_all_tiles=must_use_all_tiles,
             )
             return self
         except ValueError as e:
@@ -623,11 +692,18 @@ class Board:
         depth: int,
         slot_tiebreak: dict[SlotPosition, float] | None = None,
         first_pos: SlotPosition | None = None,
+        must_use_all_tiles: bool = False,
     ) -> "Board":
         """Recursive helper for `solve()` (TODO)."""
         self.solve_stats.boards_checked += 1
 
-        # Update max depth reached
+        # Cache exact playable-domain sizes for this recursion frame.
+        playable_exact_cache: dict[SlotPosition, int] = {}
+        playable_capped_cache: dict[SlotPosition, int] = {}
+        use_playable_in_sort_key = False
+
+        # Update depth stats
+        self.solve_stats.depth_hit[depth] += 1
         self.solve_stats.max_depth_reached = max(self.solve_stats.max_depth_reached, depth)
 
         # Display progress every 10,000 boards checked
@@ -636,11 +712,12 @@ class Board:
             print(
                 f"Checked {int_comma(self.solve_stats.boards_checked)} board states "
                 f"after {time_str(elapsed_time)}; max depth {self.solve_stats.max_depth_reached}, "
-                f"current depth {depth}; max filled slots {self.solve_stats.max_filled_slots}.",
+                f"max filled {self.solve_stats.max_filled_slots}. Depths: ",
+                f"{self.solve_stats.depth_hit[: self.solve_stats.max_depth_reached + 1]}",
                 flush=True,
             )
 
-        def _slot_sort_key(pos: SlotPosition) -> tuple[int, int, int, float]:
+        def _slot_sort_key(pos: SlotPosition) -> tuple[int, int, int, int, float]:
             """Key function for sorting slots to fill.
 
             Args:
@@ -653,16 +730,24 @@ class Board:
             if slot is None:
                 raise RuntimeError(f"No slot found at position {pos} during sorting.")
 
+            playable = (
+                _tile_playable_domain_size_capped(pos)
+                if use_playable_in_sort_key
+                else slot.domain_size
+            )
+
             rand = 0.0 if slot_tiebreak is None else slot_tiebreak[pos]
             return (
                 (
-                    -slot_degrees[pos],
+                    playable,
                     slot.domain_size,
-                    0, #manhattan_distances[pos],
+                    -slot_degrees[pos],
+                    0,  # manhattan_distances[pos],
                     rand,  # Is 0.0 if randomization is disabled
                 )
                 if depth < 4
                 else (
+                    playable,
                     slot.domain_size,
                     -slot_degrees[pos],
                     0,  # manhattan_distances[pos],
@@ -692,7 +777,7 @@ class Board:
                     continue
                 weight = (
                     2
-                    if slot.intersections[i] is None #or slot.intersections[i].other_slot.fixed
+                    if slot.intersections[i] is None  # or slot.intersections[i].other_slot.fixed
                     else 1
                 )
                 open_positions.append((i, weight))
@@ -701,12 +786,26 @@ class Board:
 
             ord_a = ord("A")
 
+            # If this is a "must use all tiles" puzzle, we can soundly prune candidate
+            # words that would make some remaining tile letter impossible to place.
+            prune_unplayable = must_use_all_tiles and depth >= UNPLAYABLE_TILE_CHECK_DEPTH
+            dot = ord(".")
+            needed_letter_idxs: list[int] = []
+            needed_mask = 0
+            if prune_unplayable:
+                for ch_index, c in enumerate(tile_bag):
+                    if c:
+                        needed_letter_idxs.append(ch_index)
+                        needed_mask |= 1 << ch_index
+
             # Secondary value ordering heuristic: prefer words that keep intersecting
             # slots flexible under current domains (sum of resulting domain sizes).
             #
             # Efficient implementation: per intersection, precompute a 26-entry table
             # of |D_y ∩ bucket(letter)| once, then score each word via O(#inters) lookups.
             active_intersections: list[tuple[int, list[int]]] = []
+            affected_neighbors: list[tuple[SlotPosition, int, int]] = []
+            affected_set: set[SlotPosition] = set()
             for i in range(slot.length):
                 if self.layout[cell_idxs[i]] != dot:
                     continue  # Not placing a tile here; this word doesn't constrain neighbors.
@@ -715,6 +814,13 @@ class Board:
                     continue
                 other_slot = inter.other_slot
                 j = inter.index_in_other_slot
+
+                other_pos = other_slot.pos
+                if other_pos is not None and other_pos in self._unfilled_slots:
+                    if other_pos not in affected_set:
+                        affected_set.add(other_pos)
+                        affected_neighbors.append((other_pos, j, i))
+
                 table = [0] * 26
                 buckets = WORD_BUCKETS[other_slot.length][j]
                 other_domain = other_slot.domain
@@ -722,9 +828,96 @@ class Board:
                     table[ch_index] = count_and(other_domain, buckets[ch_index])
                 active_intersections.append((i, table))
 
+            unaffected_mask = 0
+            if prune_unplayable and needed_mask:
+                # Letters playable in *unaffected* slots (i.e. slots whose domains/open-cells
+                # will not change when we play a word in `pos`).
+                #
+                # We intentionally exclude:
+                # - `pos` itself (it will be fully filled by the candidate word)
+                # - intersecting neighbor slots (their domains and one open cell change)
+                for other_pos in self._unfilled_slots:
+                    if other_pos == pos or other_pos in affected_set:
+                        continue
+                    other_slot = self.slot_map[other_pos]
+                    other_cell_idxs = self._slot_cell_idxs[other_pos]
+                    for p in range(other_slot.length):
+                        if self.layout[other_cell_idxs[p]] != dot:
+                            continue
+                        buckets = WORD_BUCKETS[other_slot.length][p]
+                        for ch_index in needed_letter_idxs:
+                            if (unaffected_mask >> ch_index) & 1:
+                                continue
+                            if count_and(other_slot.domain, buckets[ch_index]):
+                                unaffected_mask |= 1 << ch_index
+                        if unaffected_mask == needed_mask:
+                            break
+                    if unaffected_mask == needed_mask:
+                        break
+
             scored: list[tuple[float, int, int]] = []
             for word_idx in slot.domain.search(1):
                 w = WORDS_BY_LENGTH[slot.length][word_idx]
+
+                if prune_unplayable and needed_mask:
+                    # Compute remaining tiles after placing `w` at `pos`.
+                    # If any required tile is unavailable, skip (place_word would fail anyway).
+                    used = [0] * 26
+                    ok = True
+                    for i, _weight in open_positions:
+                        ch_index = ord(w[i]) - ord_a
+                        used[ch_index] += 1
+                        if used[ch_index] > tile_bag[ch_index]:
+                            ok = False
+                            break
+                    if not ok:
+                        continue
+
+                    remaining_mask = 0
+                    for ch_index in needed_letter_idxs:
+                        if tile_bag[ch_index] - used[ch_index] > 0:
+                            remaining_mask |= 1 << ch_index
+
+                    # If all remaining letters are playable in unaffected slots, we're good.
+                    uncovered_mask = remaining_mask & ~unaffected_mask
+                    if uncovered_mask:
+                        covered_mask = 0
+
+                        # Check affected neighbor slots under the direct intersection
+                        # constraints imposed by placing `w`.
+                        for other_pos, j_other, i_this in affected_neighbors:
+                            other_slot = self.slot_map[other_pos]
+                            ch_index_at_inter = ord(w[i_this]) - ord_a
+                            char_bits = WORD_BUCKETS[other_slot.length][j_other][ch_index_at_inter]
+                            new_domain = other_slot.domain & char_bits
+                            if not new_domain.any():
+                                covered_mask = 0
+                                break
+
+                            other_cell_idxs = self._slot_cell_idxs[other_pos]
+                            for p in range(other_slot.length):
+                                if p == j_other:
+                                    continue  # Intersection cell becomes filled by this move.
+                                if self.layout[other_cell_idxs[p]] != dot:
+                                    continue
+                                buckets = WORD_BUCKETS[other_slot.length][p]
+                                # Only test letters we still need and haven't covered yet.
+                                for ch_index in needed_letter_idxs:
+                                    if not ((uncovered_mask >> ch_index) & 1):
+                                        continue
+                                    if (covered_mask >> ch_index) & 1:
+                                        continue
+                                    if count_and(new_domain, buckets[ch_index]):
+                                        covered_mask |= 1 << ch_index
+                                if (covered_mask & uncovered_mask) == uncovered_mask:
+                                    break
+                            if (covered_mask & uncovered_mask) == uncovered_mask:
+                                break
+
+                        if (covered_mask & uncovered_mask) != uncovered_mask:
+                            # This candidate would strand at least one remaining tile letter.
+                            continue
+
                 score = 1.0
                 for i, weight in open_positions:
                     idx = ord(w[i]) - ord_a
@@ -781,6 +974,24 @@ class Board:
                     if cutoff is not None and playable > cutoff:
                         return playable
             return playable
+
+        def _tile_playable_domain_size_exact(pos: SlotPosition) -> int:
+            """Exact playable-domain size for `pos`, cached within this recursion frame."""
+            cached = playable_exact_cache.get(pos)
+            if cached is not None:
+                return cached
+            value = _tile_playable_domain_size(pos, cutoff=None)
+            playable_exact_cache[pos] = value
+            return value
+
+        def _tile_playable_domain_size_capped(pos: SlotPosition) -> int:
+            """Playable-domain size for `pos`, capped for speed and cached per frame."""
+            cached = playable_capped_cache.get(pos)
+            if cached is not None:
+                return cached
+            value = _tile_playable_domain_size(pos, cutoff=PLAYABLE_SORT_CUTOFF)
+            playable_capped_cache[pos] = value
+            return value
 
         def _tile_aware_candidate_count(unfilled_count: int) -> int:
             """Choose how many MRV-ranked slots to consider for tile-aware selection.
@@ -854,6 +1065,56 @@ class Board:
             slot_x.domain_size = new_domain.count()
             return True
 
+        def _prune_domain_by_current_tiles(pos: SlotPosition) -> bool:
+            """Prune `pos` domain using the *current* tile bag.
+
+            Removes any word requiring more tiles of some letter than currently remain,
+            counting only letters that would be placed into '.' cells (fixed letters on the
+            board do not consume tiles).
+
+            This pruning is sound because tile availability only decreases during search.
+            """
+            slot = self.slot_map[pos]
+            if slot.domain_size < TILE_DOMAIN_PRUNE_MIN_DOMAIN:
+                return False
+
+            dot = ord(".")
+            cell_idxs = self._slot_cell_idxs[pos]
+            open_positions = [i for i, idx in enumerate(cell_idxs) if self.layout[idx] == dot]
+            if not open_positions:
+                return False
+
+            to_clear: array[int] = array("I")
+            ord_a = ord("A")
+            for word_idx in slot.domain.search(1):
+                w = WORDS_BY_LENGTH[slot.length][word_idx]
+                counts: dict[int, int] = {}
+                ok = True
+                for i in open_positions:
+                    tile_idx = ord(w[i]) - ord_a
+                    new_count = counts.get(tile_idx, 0) + 1
+                    if new_count > tile_bag[tile_idx]:
+                        ok = False
+                        break
+                    counts[tile_idx] = new_count
+                if not ok:
+                    to_clear.append(word_idx)
+
+            if not to_clear:
+                return False
+
+            new_domain = slot.domain.copy()
+            for word_idx in to_clear:
+                new_domain[word_idx] = False
+
+            if new_domain == slot.domain:
+                return False
+
+            self._undo_trails.domain_changes.append((pos, slot.domain, slot.domain_size))
+            slot.domain = new_domain
+            slot.domain_size = new_domain.count()
+            return True
+
         def _ac3(seed_pos: SlotPosition) -> bool:
             """Run AC-3 propagation seeded by a recent assignment at seed_pos.
 
@@ -867,9 +1128,31 @@ class Board:
             for neighbor_pos, _, _ in self.constraint_graph.neighbors.get(seed_pos, []):
                 q.append((neighbor_pos, seed_pos))
 
+            # Optional: prune by current tiles when tiles are tight / depth is late.
+            tile_entropy = sum(1 for c in tile_bag if c)
+            do_tile_prune = (
+                tile_entropy <= TILE_DOMAIN_PRUNE_TILE_ENTROPY_MAX
+                or depth >= TILE_DOMAIN_PRUNE_DEPTH
+            )
+
+            # If enabled, run tile pruning globally up-front to accelerate convergence.
+            if do_tile_prune and TILE_DOMAIN_PRUNE_GLOBAL and (depth % TILE_DOMAIN_PRUNE_GLOBAL_FREQ == 0):
+                for pos in self._unfilled_slots:
+                    if _prune_domain_by_current_tiles(pos):
+                        if self.slot_map[pos].domain_size == 0:
+                            return False
+                        for neighbor_pos, _, _ in self.constraint_graph.neighbors.get(pos, []):
+                            q.append((neighbor_pos, pos))
+
             while q:
                 x_pos, y_pos = q.popleft()
-                if _revise(x_pos, y_pos):
+                changed = _revise(x_pos, y_pos)
+
+                if do_tile_prune and self.slot_map[x_pos].domain_size > 0:
+                    if _prune_domain_by_current_tiles(x_pos):
+                        changed = True
+
+                if changed:
                     if self.slot_map[x_pos].domain_size == 0:
                         return False
                     for z_pos, _, _ in self.constraint_graph.neighbors.get(x_pos, []):
@@ -934,19 +1217,146 @@ class Board:
                 self.print()
                 print(f"Remaining tiles: {tile_bag_to_string(tile_bag)}")
 
+        # Fail fast (optionally) if some remaining tiles cannot be placed anywhere in any
+        # remaining slot domain. This is sound only when ALL remaining tiles must be used.
+        if must_use_all_tiles and self._unfilled_slots and sum(int(x) for x in tile_bag) > 0:
+            dot = ord(".")
+            needed = [i for i, c in enumerate(tile_bag) if c]
+            tile_entropy = len(needed)
+
+            run_capacity_check = (
+                tile_entropy <= TILE_CAPACITY_CHECK_TILE_ENTROPY_MAX
+                or depth >= TILE_CAPACITY_CHECK_DEPTH
+            )
+
+            if run_capacity_check and needed:
+                # Count-based capacity check:
+                # For each remaining letter L with count t[L], compute an upper bound U[L]
+                # on how many remaining '.' cells could accept L under current domains.
+                # If t[L] > U[L], the state is impossible.
+                capacity = [0] * 26
+                allowed_cache: dict[tuple[SlotPosition, int], int] = {}
+                full_mask = 0
+                for ch_index in needed:
+                    full_mask |= 1 << ch_index
+
+                for flat_idx, b in enumerate(self.layout):
+                    if b != dot:
+                        continue
+                    row, col = divmod(flat_idx, self.n_cols)
+                    inters = self.intersection_map.get((row, col))
+                    if not inters:
+                        self.undo_place_word(frame_mark, tile_bag)
+                        raise ValueError(
+                            "Open cell is not part of any length>1 slot; cannot be filled."
+                        )
+
+                    cell_mask = full_mask
+                    for inter in inters:
+                        slot = inter.other_slot
+                        if slot.pos is None:
+                            raise RuntimeError("Uninitialized position in slot.")
+                        key = (slot.pos, inter.index_in_other_slot)
+                        mask = allowed_cache.get(key)
+                        if mask is None:
+                            buckets = WORD_BUCKETS[slot.length][inter.index_in_other_slot]
+                            mask = 0
+                            for ch_index in needed:
+                                if count_and(slot.domain, buckets[ch_index]):
+                                    mask |= 1 << ch_index
+                            allowed_cache[key] = mask
+
+                        cell_mask &= mask
+                        if cell_mask == 0:
+                            break
+
+                    if cell_mask == 0:
+                        self.undo_place_word(frame_mark, tile_bag)
+                        raise ValueError(
+                            "No remaining tile letter can fit at some open cell under current "
+                            "domains."
+                        )
+
+                    for ch_index in needed:
+                        if (cell_mask >> ch_index) & 1:
+                            capacity[ch_index] += 1
+
+                deficits: list[str] = []
+                ord_a = ord("A")
+                for ch_index in needed:
+                    need = int(tile_bag[ch_index])
+                    cap = capacity[ch_index]
+                    if need > cap:
+                        deficits.append(f"{chr(ord_a + ch_index)}({need}>{cap})")
+
+                if deficits:
+                    self.undo_place_word(frame_mark, tile_bag)
+                    raise ValueError(
+                        "Remaining tiles exceed placement capacity under current domains: "
+                        + " ".join(deficits)
+                    )
+
+            # If we didn't run the capacity check, fall back to a cheaper existence check.
+            elif needed and depth >= UNPLAYABLE_TILE_CHECK_DEPTH:
+                still_needed = [False] * 26
+                for i in needed:
+                    still_needed[i] = True
+                needed_left = len(needed)
+
+                ord_a = ord("A")
+                for pos in self._unfilled_slots:
+                    slot = self.slot_map[pos]
+                    cell_idxs = self._slot_cell_idxs[pos]
+                    for i, idx in enumerate(cell_idxs):
+                        if self.layout[idx] != dot:
+                            continue
+                        buckets = WORD_BUCKETS[slot.length][i]
+                        for ch_index in needed:
+                            if not still_needed[ch_index]:
+                                continue
+                            if count_and(slot.domain, buckets[ch_index]):
+                                still_needed[ch_index] = False
+                                needed_left -= 1
+                                if needed_left == 0:
+                                    break
+                        if needed_left == 0:
+                            break
+                    if needed_left == 0:
+                        break
+
+                if needed_left:
+                    unplayable = "".join(chr(ord_a + i) for i in range(26) if still_needed[i])
+                    self.undo_place_word(frame_mark, tile_bag)
+                    raise ValueError(
+                        f"Unplayable remaining tile(s) under current domains: {unplayable}"
+                    )
+
         # Select the next slot to fill
         if depth == 0 and first_pos is not None and first_pos in self._unfilled_slots:
             pos = first_pos
         else:
+            tile_entropy = sum(1 for c in tile_bag if c)
+            # Only enable playable-count sorting when it is likely to pay off.
+            # Using a dynamic threshold avoids turning this on immediately for typical
+            # 20-30 slot puzzles.
+            threshold = max(
+                PLAYABLE_SORT_MIN_UNFILLED,
+                int(len(self.slot_map) * PLAYABLE_SORT_FRACTION),
+            )
+            use_playable_in_sort_key = (
+                depth >= PLAYABLE_SORT_DEPTH
+                or tile_entropy <= PLAYABLE_SORT_TILE_ENTROPY_MAX
+                or len(self._unfilled_slots) <= threshold
+            )
             ranked = sorted(self._unfilled_slots, key=_slot_sort_key)
             k = _tile_aware_candidate_count(len(self._unfilled_slots))
             candidates = ranked[:k]
 
             # Search top candidates for the one with fewest playable words under current tile bag
             pos = candidates[0]
-            best_playable = _tile_playable_domain_size(pos)
+            best_playable = _tile_playable_domain_size_exact(pos)
             for other in candidates[1:]:
-                playable = _tile_playable_domain_size(other, cutoff=best_playable)
+                playable = _tile_playable_domain_size_exact(other)
                 if playable < best_playable:
                     pos = other
                     best_playable = playable
@@ -975,7 +1385,13 @@ class Board:
                     # AC-3 failed; undo and try next word
                     self.undo_place_word(undo_info, tile_bag)
                     continue
-                return self.solve_helper(tile_bag, manhattan_distances, slot_degrees, depth + 1)
+                return self.solve_helper(
+                    tile_bag,
+                    manhattan_distances,
+                    slot_degrees,
+                    depth + 1,
+                    must_use_all_tiles=must_use_all_tiles,
+                )
             except ValueError:
                 # Recursive call failed; undo and try next word
                 self.undo_place_word(undo_info, tile_bag)

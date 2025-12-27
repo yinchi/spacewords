@@ -34,6 +34,7 @@ def create_tile_bag(tiles: str) -> TileBag:
             raise ValueError(f"Invalid tile character: {ch}")
     return bag
 
+
 def tile_bag_to_string(tile_bag: TileBag) -> str:
     """Convert a tile bag to a string representation.
 
